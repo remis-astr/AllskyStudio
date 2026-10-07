@@ -1688,9 +1688,43 @@ def _auto_stretch_params(img: np.ndarray, valid: np.ndarray, state: dict,
     return dict(m, beta=_beta_for(m["bg"] / m["white"], t), target=t, n_eff=n_eff)
 
 
+def _stretch_input(img: np.ndarray, p: dict) -> np.ndarray:
+    """
+    Channels after black point, white balance and white normalisation —
+    the [0, 1] domain the stretch curve is applied to (black = 0, white = 1).
+    """
+    med   = p["med"][::-1].astype(np.float32)          # RGB → BGR
+    gains = p["gains"][::-1].astype(np.float32)
+    c0    = p["c0"][::-1].astype(np.float32)
+    inv = np.float32(1.0 / p["white"])
+    # ((img − med)·gains + med − c0) / white, as one affine per channel
+    return img * (gains * inv) + (med - c0 - med * gains) * inv
+
+
+_GHS_LUT_CACHE: dict = {}
+
+
+def _ghs_curve_lut(ghs: dict) -> np.ndarray:
+    """GHS curve (_ghs_on_array, the app's formula) tabulated on [0, 1]."""
+    key = tuple(round(float(ghs[k]), 6) for k in ("SP", "D", "b", "LP", "HP"))
+    lut = _GHS_LUT_CACHE.get(key)
+    if lut is None:
+        x = np.linspace(0.0, 1.0, _AS_LUT_N)
+        lut = _ghs_on_array(x, *key).astype(np.float32)
+        # With HP = 1, _ghs_on_array returns the identity at exactly x = 1
+        # (T(1) = 1 even when b has compressed the highlights to ~0.2): a
+        # jump at the white point. Continue the curve smoothly instead.
+        lut[-1] = 2.0 * lut[-2] - lut[-3]
+        if len(_GHS_LUT_CACHE) > 32:
+            _GHS_LUT_CACHE.clear()
+        _GHS_LUT_CACHE[key] = lut
+    return lut
+
+
 def _auto_stretch_render(img: np.ndarray, valid: np.ndarray, p: dict,
                          local_contrast: float = 0.0,
-                         clip: "np.ndarray | None" = None) -> np.ndarray:
+                         clip: "np.ndarray | None" = None,
+                         curve: "np.ndarray | None" = None) -> np.ndarray:
     """
     Port of autoStretchRender: colour-preserving arcsinh (Lupton 2004) — the
     curve is computed on the luminance and R, G, B are scaled by the same
@@ -1699,34 +1733,42 @@ def _auto_stretch_render(img: np.ndarray, valid: np.ndarray, p: dict,
     balance is faded to a neutral gain — otherwise the equal clipped channels
     times the WB gains (×1.8 on R and B for a raw IMX477) turn star cores
     magenta/blue.
+    curve: a manual tone curve tabulated on [0, 1] (GHS) replacing the auto
+    arcsinh; black point, white balance and white stay the measured ones.
     """
     h, w = img.shape[:2]
-    med   = p["med"][::-1].astype(np.float32)          # RGB → BGR
     gains = p["gains"][::-1].astype(np.float32)
-    c0    = p["c0"][::-1].astype(np.float32)
     beta  = p["beta"]
-    inv = np.float32(1.0 / p["white"])
-    # v = ((img − med)·gains + med − c0) / white, as one affine per channel
-    v = img * (gains * inv) + (med - c0 - med * gains) * inv
+    v = _stretch_input(img, p)
     if clip is not None:
         t = np.minimum(clip * 3.0, 1.0)
         t = cv2.GaussianBlur(t, (0, 0), 1.0)[:, :, None]
-        g_n = np.float32(gains.mean())
-        v_n = img * (g_n * inv) + (med - c0 - med * g_n) * inv
+        g_n = float(gains.mean())
+        v_n = _stretch_input(img, dict(p, gains=np.full(3, g_n)))
         v_n -= v
         v_n *= t
         v += v_n
     I = cv2.transform(v, _LUMA_MEAN)
     Ig = cv2.blur(I, (3, 3), borderType=cv2.BORDER_REPLICATE)   # no chroma noise
     ab = float(np.arcsinh(beta))
-    # f(x) = asinh(βx)/asinh(β): table on [0, 1] (as in auto_stretch.js), exact above
-    lut = (np.arcsinh(beta * np.linspace(0.0, 1.0, _AS_LUT_N)) / ab).astype(np.float32)
+    if curve is None:
+        # f(x) = asinh(βx)/asinh(β): table on [0, 1] (as in auto_stretch.js), exact above
+        lut = (np.arcsinh(beta * np.linspace(0.0, 1.0, _AS_LUT_N)) / ab).astype(np.float32)
+        slope0 = beta / ab                       # f(x)/x when x → 0
+    else:
+        lut = curve
+        slope0 = float(lut[1]) * (_AS_LUT_N - 1)
     idx = np.clip(Ig * (_AS_LUT_N - 1) + 0.5, 0, _AS_LUT_N - 1).astype(np.int32)
     fI = lut[idx]
     fI[Ig <= 0] = 0.0
     over = Ig >= 1.0
     if over.any():
-        fI[over] = np.arcsinh(beta * Ig[over]) / ab
+        if curve is None:
+            fI[over] = np.arcsinh(beta * Ig[over]) / ab
+        else:
+            # beyond the white: continue with the curve's end slope
+            end_slope = max(0.0, float(lut[-1] - lut[-2]) * (_AS_LUT_N - 1))
+            fI[over] = float(lut[-1]) + (Ig[over] - 1.0) * end_slope
     if local_contrast > 0:
         F = 4
         sw, sh = -(-w // F), -(-h // F)
@@ -1736,7 +1778,7 @@ def _auto_stretch_render(img: np.ndarray, valid: np.ndarray, p: dict,
             small = cv2.blur(small, (2 * r + 1, 2 * r + 1), borderType=cv2.BORDER_REPLICATE)
         blur = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
         fI = np.maximum(0.0, fI + local_contrast * (fI - blur) * (1.0 - np.minimum(fI, 1.0)))
-    k = np.where(Ig > 1e-7, fI / np.maximum(Ig, 1e-7), beta / ab).astype(np.float32)
+    k = np.where(Ig > 1e-7, fI / np.maximum(Ig, 1e-7), slope0).astype(np.float32)
     out = v * k[:, :, None]
     mx = _max3(out)
     out *= (255.0 / np.maximum(mx, 1.0))[:, :, None]   # out of gamut: keep hue
@@ -1876,6 +1918,8 @@ def _stack_video_config(params: dict) -> dict:
         hot           = bool(params["sv_hot_pixels"]),
         bg_norm       = bool(params["sv_bg_norm"]),
         weighting     = bool(params["sv_weighting"]),
+        stretch       = params.get("sv_stretch", "auto"),   # "auto" | "ghs"
+        ghs           = params.get("sv_ghs", dict(SP=0.0, D=100.0, b=0.0, LP=0.0, HP=1.0)),
     )
 
 
@@ -2137,7 +2181,8 @@ class _StackRenderer:
         self.last_params = p_st
         if p_st is None:
             return None
-        out = _auto_stretch_render(final_f, valid, p_st, cfg["lce"], clip)
+        curve = _ghs_curve_lut(cfg["ghs"]) if cfg["stretch"] == "ghs" else None
+        out = _auto_stretch_render(final_f, valid, p_st, cfg["lce"], clip, curve)
         if cfg["rm_green"]:
             out = _remove_green(out)
         return _apply_saturation_clamped(out, cfg["saturation"])
@@ -2761,6 +2806,53 @@ def _mem_available_gb() -> "float | None":
     return None
 
 
+def _draw_stretch_histogram(lum: np.ndarray, curve: np.ndarray, w: int, h: int,
+                            bg_x: "float | None", sp: "float | None") -> np.ndarray:
+    """
+    Histogram of the stack luminance in the stretch domain (black = 0,
+    white = 1) with the tone curve on top. √x horizontal axis: the sky
+    background sits at 1–3 % of the white on linear data and would be a
+    single column on a linear axis. Pure OpenCV drawing (no matplotlib).
+    """
+    img = np.full((h, w, 3), 26, np.uint8)
+    m_l, m_r, m_t, m_b = 6, 6, 8, 18
+    pw, ph = w - m_l - m_r, h - m_t - m_b
+    X = lambda x: m_l + int(round(np.sqrt(np.clip(x, 0.0, 1.0)) * (pw - 1)))
+    Y = lambda y: m_t + int(round((1.0 - np.clip(y, 0.0, 1.0)) * (ph - 1)))
+    # histogram (log counts) in √x bins
+    u = np.sqrt(np.clip(lum, 0.0, 1.0))
+    counts, _ = np.histogram(u, bins=pw, range=(0.0, 1.0))
+    c = np.log1p(counts.astype(np.float64))
+    if c.max() > 0:
+        c /= c.max()
+    for i, v in enumerate(c):
+        if v > 0:
+            cv2.line(img, (m_l + i, m_t + ph - 1), (m_l + i, m_t + ph - 1 - int(v * (ph - 1))),
+                     (95, 95, 95), 1)
+    # ticks
+    for t in (0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0):
+        x = X(t)
+        cv2.line(img, (x, m_t + ph), (x, m_t + ph + 3), (150, 150, 150), 1)
+        lbl = f"{t:g}"
+        cv2.putText(img, lbl, (min(x - 4, w - 6 * len(lbl) - 2), h - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (170, 170, 170), 1, cv2.LINE_AA)
+    # background / SP markers
+    if bg_x is not None:
+        cv2.line(img, (X(bg_x), m_t), (X(bg_x), m_t + ph), (90, 200, 90), 1)
+        cv2.putText(img, "fond", (X(bg_x) + 3, m_t + 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35, (90, 200, 90), 1, cv2.LINE_AA)
+    if sp is not None and sp > 0:
+        cv2.line(img, (X(sp), m_t), (X(sp), m_t + ph), (230, 200, 60), 1)
+        cv2.putText(img, "SP", (X(sp) + 3, m_t + 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35, (230, 200, 60), 1, cv2.LINE_AA)
+    # tone curve (output 0–1 vertical, linear)
+    xs = (np.arange(pw) / max(1, pw - 1)) ** 2
+    ys = curve[np.clip((xs * (len(curve) - 1)).astype(np.int64), 0, len(curve) - 1)]
+    pts = np.array([[m_l + i, Y(y)] for i, y in enumerate(ys)], np.int32)
+    cv2.polylines(img, [pts], False, (40, 150, 255), 2, cv2.LINE_AA)
+    return img
+
+
 def _bgr_to_photo(bgr: np.ndarray, w: int, h: int):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     pil = _PILImage.fromarray(rgb)
@@ -2788,7 +2880,7 @@ class StackVideoPreview(ctk.CTkToplevel):
     def __init__(self, master: ctk.CTk, get_params):
         super().__init__(master)
         self.title("Aperçu — Vidéo de progression du stack")
-        self.geometry(f"{self._W * 3 + 100}x{self._H + 420}")
+        self.geometry(f"{self._W * 3 + 100}x{self._H + 600}")
         self.resizable(True, True)
         self._get_params = get_params
         self._gen = 0                      # bumped at each recompute: stale threads stop
@@ -2820,6 +2912,8 @@ class StackVideoPreview(ctk.CTkToplevel):
                         command=self.refresh_render).pack(side="left", padx=14)
         ctk.CTkButton(bar, text="Recalculer", width=110,
                       command=self._start_stack).pack(side="right")
+        ctk.CTkButton(bar, text="GHS : partir de l'auto", width=170,
+                      command=self._ghs_from_auto).pack(side="right", padx=8)
 
         self._progress = ctk.CTkProgressBar(self)
         self._progress.set(0.0)
@@ -2845,6 +2939,14 @@ class StackVideoPreview(ctk.CTkToplevel):
             lbl.pack(fill="both", expand=True, padx=4, pady=(0, 6))
             lbl.bind("<Button-1>", lambda e, k=key: self._open_zoom(k))
             self._titles[key], self._lbls[key] = t, lbl
+
+        hist_row = ctk.CTkFrame(self, fg_color="transparent")
+        hist_row.pack(fill="x", padx=12, pady=(0, 4))
+        ctk.CTkLabel(hist_row, text="Histogramme du stack (K images, échelle √) et "
+                                    "courbe d'étirement",
+                     font=ctk.CTkFont(size=11), text_color="gray60").pack(anchor="w")
+        self._lbl_hist = _tk.Label(hist_row, background="#1a1a1a", height=150)
+        self._lbl_hist.pack(fill="x")
 
         self._diag = ctk.CTkTextbox(self, height=190, wrap="word",
                                     font=ctk.CTkFont(family="monospace", size=12))
@@ -2957,7 +3059,7 @@ class StackVideoPreview(ctk.CTkToplevel):
         params = self._get_params()
         cfg = dict(d["cfg"])
         cfg.update({k: v for k, v in _stack_video_config(params).items()
-                    if k in ("target", "lce", "rm_green", "saturation")})
+                    if k in ("target", "lce", "rm_green", "saturation", "stretch", "ghs")})
         prep, geom = d["prep"], d["prep"]["geom"]
         renderer = _StackRenderer(cfg)
         counter = bool(params.get("sv_counter", True))
@@ -2986,6 +3088,22 @@ class StackVideoPreview(ctk.CTkToplevel):
         self._imgs = {"raw": raw, "one": one, "k": kimg}
         self._titles["k"].configure(text=f"{d['k']} images empilées")
         self._show()
+        self._p_k = p_k
+        if p_k is not None:
+            img_k = d["snapk"][0]
+            lum = cv2.transform(_stretch_input(img_k, p_k), _LUMA_MEAN)
+            lum = lum[geom.sky_mask & (_max3(img_k) > 0.0)][::4]
+            ghs_on = cfg["stretch"] == "ghs"
+            curve = (_ghs_curve_lut(cfg["ghs"]) if ghs_on else
+                     (np.arcsinh(p_k["beta"] * np.linspace(0.0, 1.0, _AS_LUT_N))
+                      / np.arcsinh(p_k["beta"])).astype(np.float32))
+            hw = max(300, self._panels.winfo_width() - 10)
+            hist = _draw_stretch_histogram(lum, curve, hw, 150,
+                                           p_k["bg"] / p_k["white"],
+                                           cfg["ghs"]["SP"] if ghs_on else None)
+            self._hist_bgr = hist
+            self._photo_hist = _bgr_to_photo(hist, hw, 150)
+            self._lbl_hist.configure(image=self._photo_hist)
         self._set_diag(self._diagnostics(d, params, p_k, t_render))
 
     def _show(self):
@@ -3042,7 +3160,17 @@ class StackVideoPreview(ctk.CTkToplevel):
                      + f" ({sat:.0f} en unités du stack) — couleur neutralisée sur les "
                        "cœurs d'étoiles écrêtés. Un halo coloré autour des étoiles "
                        "brillantes vient de l'optique (aberration chromatique).")
-        if p_k is not None:
+        cfg_now = _stack_video_config(params)
+        if p_k is not None and cfg_now["stretch"] == "ghs":
+            g = cfg_now["ghs"]
+            lut = _ghs_curve_lut(g)
+            bg_x = p_k["bg"] / p_k["white"]
+            bg_out = float(lut[int(round(np.clip(bg_x, 0, 1) * (_AS_LUT_N - 1)))])
+            L.append(f"Étirement : GHS manuel (SP {g['SP']:.4f}, D {g['D']:.0f}, b {g['b']:.1f}, "
+                     f"LP {g['LP']:.4f}, HP {g['HP']:.2f}) — fond à {100 * bg_x:.1f} % du blanc "
+                     f"en entrée → {100 * bg_out:.0f} % en sortie (l'auto viserait "
+                     f"{100 * p_k['target']:.0f} %, β = {p_k['beta']:.0f}).")
+        elif p_k is not None:
             L.append(f"Étirement ({d['k']} images) : fond visé {100 * p_k['target']:.0f} %, "
                      f"β = {p_k['beta']:.0f}, gains R/V/B = "
                      + "/".join(f"{g:.2f}" for g in p_k["gains"])
@@ -3087,6 +3215,14 @@ class StackVideoPreview(ctk.CTkToplevel):
         return "\n".join(L)
 
     # ── Misc ──────────────────────────────────────────────────────────────────
+
+    def _ghs_from_auto(self):
+        p_k = getattr(self, "_p_k", None)
+        if p_k is None:
+            self._set_status("Attendre la fin du mini-stack avant « partir de l'auto ».")
+            return
+        self.master._sv_ghs_from_auto(p_k["beta"])
+        self._set_status(f"GHS initialisé sur l'étirement auto : SP 0, D {p_k['beta']:.0f}, b 0.")
 
     def _set_status(self, text: str):
         self._lbl_status.configure(text=text)
@@ -3229,6 +3365,12 @@ class AllSkyApp(ctk.CTk):
             ("sv_bg_norm",        self._sv_bg_norm),
             ("sv_weighting",      self._sv_weighting),
             ("sv_counter",        self._sv_counter),
+            ("sv_stretch",        self._sv_stretch_var),
+            ("sv_ghs_SP",         self._sv_ghs_SP),
+            ("sv_ghs_D",          self._sv_ghs_D),
+            ("sv_ghs_b",          self._sv_ghs_b),
+            ("sv_ghs_LP",         self._sv_ghs_LP),
+            ("sv_ghs_HP",         self._sv_ghs_HP),
         ]
 
     def _save_settings(self):
@@ -3302,16 +3444,19 @@ class AllSkyApp(ctk.CTk):
 
     def _slider_row(self, parent, label: str, variable,
                     from_: float, to: float, step: float,
-                    integer: bool = False) -> ctk.CTkSlider:
+                    integer: bool = False, decimals: int = 2) -> ctk.CTkSlider:
         """Creates a labelled slider row and returns the slider widget."""
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=2)
 
         ctk.CTkLabel(row, text=label, width=238, anchor="w").pack(side="left")
 
-        fmt = (lambda v: str(int(round(v)))) if integer else (lambda v: f"{v:.2f}")
+        fmt = (lambda v: str(int(round(v)))) if integer else (lambda v: f"{v:.{decimals}f}")
         val_lbl = ctk.CTkLabel(row, text=fmt(variable.get()), width=50, anchor="e")
         val_lbl.pack(side="right", padx=(0, 4))
+        # Keep the value label in sync with programmatic changes too
+        # (settings restore, « Partir de l'auto »), not only slider drags.
+        variable.trace_add("write", lambda *_: val_lbl.configure(text=fmt(variable.get())))
 
         n_steps = max(1, round((to - from_) / step))
 
@@ -3319,11 +3464,9 @@ class AllSkyApp(ctk.CTk):
             if integer:
                 v = int(round(float(raw)))
                 variable.set(v)
-                val_lbl.configure(text=str(v))
             else:
                 v = round(float(raw) / step) * step
                 variable.set(round(v, 10))
-                val_lbl.configure(text=f"{v:.2f}")
 
         slider = ctk.CTkSlider(row, from_=from_, to=to,
                                number_of_steps=n_steps,
@@ -3838,8 +3981,7 @@ class AllSkyApp(ctk.CTk):
         ctk.CTkLabel(self._align_sub,
                      text="Les N images consécutives à partir de la référence (ou du début du "
                           "dossier si aucune n'est choisie) sont alignées sur le ciel puis "
-                          "moyennées. N élevé = moins de bruit mais traitement plus long. "
-                          "Les flèches ← → du clavier sur le curseur ajustent N à l'unité.",
+                          "moyennées. N élevé = moins de bruit mais traitement plus long.",
                      font=ctk.CTkFont(size=11), text_color="gray60",
                      wraplength=600).pack(anchor="w", pady=(0, 6))
 
@@ -3892,8 +4034,11 @@ class AllSkyApp(ctk.CTk):
         self._sv_sub = ctk.CTkFrame(tab_align, fg_color="transparent")
         self._sv_sub.pack(fill="x", padx=28)
 
-        ctk.CTkButton(self._sv_sub, text="Aperçu de la vidéo de stack…", height=32,
-                      command=self._open_sv_preview).pack(anchor="w", pady=(2, 2))
+        # Packed before _sv_sub (not inside it): the panel is disabled until
+        # the video mode is on, and a disabled button looks almost the same.
+        ctk.CTkButton(tab_align, text="Aperçu de la vidéo de stack…", height=32,
+                      command=self._open_sv_preview).pack(anchor="w", padx=28, pady=(2, 2),
+                                                          before=self._sv_sub)
         ctk.CTkLabel(self._sv_sub,
                      text="Mini-stack des K premières images (réduites) avec le même pipeline : "
                           "brute | 1 image | K images, diagnostics (alignement, poids, rejet σ, "
@@ -3937,6 +4082,47 @@ class AllSkyApp(ctk.CTk):
                           "seule la vidéo est réduite (rendu plus rapide, fichier lisible partout).",
                      font=ctk.CTkFont(size=11), text_color="gray60",
                      wraplength=600).pack(anchor="w", pady=(0, 6))
+
+        stretch_row = ctk.CTkFrame(self._sv_sub, fg_color="transparent")
+        stretch_row.pack(fill="x", pady=2)
+        ctk.CTkLabel(stretch_row, text="Étirement :", width=238, anchor="w").pack(side="left")
+        self._sv_stretch_var = ctk.StringVar(value="Automatique (Multicam)")
+        ctk.CTkOptionMenu(stretch_row, variable=self._sv_stretch_var,
+                          values=["Automatique (Multicam)", "GHS manuel"],
+                          command=lambda *_: self._toggle_align_stack(),
+                          width=220).pack(side="left", padx=8)
+
+        # Nested in _sv_sub: its rows are one level too deep for
+        # _set_frame_state(_sv_sub), so _toggle_align_stack handles it apart.
+        self._sv_ghs_sub = ctk.CTkFrame(self._sv_sub, fg_color="transparent")
+        self._sv_ghs_sub.pack(fill="x", padx=20)
+        self._sv_ghs_SP = ctk.DoubleVar(value=0.0)
+        self._sv_ghs_D  = ctk.DoubleVar(value=100.0)
+        self._sv_ghs_b  = ctk.DoubleVar(value=0.0)
+        self._sv_ghs_LP = ctk.DoubleVar(value=0.0)
+        self._sv_ghs_HP = ctk.DoubleVar(value=1.0)
+        self._slider_row(self._sv_ghs_sub, "SP — Symmetry Point",
+                         self._sv_ghs_SP, 0.0, 0.05, 0.0001, decimals=4)
+        self._slider_row(self._sv_ghs_sub, "D  — Stretch Factor",
+                         self._sv_ghs_D, 0.0, 500.0, 1.0, integer=True)
+        self._slider_row(self._sv_ghs_sub, "b  — Highlight Compression",
+                         self._sv_ghs_b, 0.0, 10.0, 0.1)
+        self._slider_row(self._sv_ghs_sub, "LP — Low Point",
+                         self._sv_ghs_LP, 0.0, 0.05, 0.0001, decimals=4)
+        self._slider_row(self._sv_ghs_sub, "HP — Highlight Point",
+                         self._sv_ghs_HP, 0.50, 1.00, 0.01)
+        ctk.CTkLabel(self._sv_ghs_sub,
+                     text="Courbe GHS appliquée entre les points noir et blanc mesurés sur le "
+                          "stack (balance des blancs automatique, couleurs préservées). Échelle "
+                          "linéaire : le fond n'est qu'à 0,1–3 % du blanc (0,3 % sur un stack "
+                          "M31 en FITS 12 bits), d'où SP au 1/10000 et D jusqu'à 500 — placer "
+                          "SP sous le marqueur « fond » de l'histogramme de l'aperçu. SP = 0, b = 0 et D = β reproduisent exactement "
+                          "l'étirement automatique (bouton « Partir de l'auto » de l'aperçu). "
+                          "Courbe fixe : le fond garde la même luminosité pendant toute la "
+                          "vidéo, seul le bruit diminue. Indépendant des réglages GHS de "
+                          "l'onglet « Image & Couleur ».",
+                     font=ctk.CTkFont(size=11), text_color="gray60",
+                     wraplength=560).pack(anchor="w", pady=(0, 6))
 
         self._sv_target_auto = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(self._sv_sub, text="Fond de ciel automatique (10 % → 18 % quand le bruit baisse)",
@@ -3990,6 +4176,7 @@ class AllSkyApp(ctk.CTk):
 
         self._set_frame_state(self._align_sub, False)
         self._set_frame_state(self._sv_sub, False)
+        self._set_frame_state(self._sv_ghs_sub, False)
 
         # ── Pinned footer: live preview + progress + run (always visible) ──
         footer = ctk.CTkFrame(self, fg_color="transparent")
@@ -4047,7 +4234,9 @@ class AllSkyApp(ctk.CTk):
         for var in (self._sv_target_auto, self._sv_target, self._sv_lce,
                     self._sv_saturation, self._sv_remove_green, self._sv_counter,
                     self._sv_duration, self._sv_progression_var,
-                    self._sv_max_width_var, self._fps_var):
+                    self._sv_max_width_var, self._fps_var, self._sv_stretch_var,
+                    self._sv_ghs_SP, self._sv_ghs_D, self._sv_ghs_b,
+                    self._sv_ghs_LP, self._sv_ghs_HP):
             var.trace_add("write", lambda *_: self._notify_sv_preview(stack=False))
         for var in (self._align_n, self._align_mask_radius, self._align_ground_cutoff,
                     self._align_k_sigma, self._sv_kappa, self._sv_linearize,
@@ -4088,6 +4277,8 @@ class AllSkyApp(ctk.CTk):
         on = self._use_align_stack.get()
         self._set_frame_state(self._align_sub, on)
         self._set_frame_state(self._sv_sub, on and self._align_is_video())
+        self._set_frame_state(self._sv_ghs_sub, on and self._align_is_video()
+                              and self._sv_stretch_var.get() == "GHS manuel")
 
     def _align_is_video(self) -> bool:
         return "mp4" in self._align_out_var.get().lower()
@@ -4139,7 +4330,31 @@ class AllSkyApp(ctk.CTk):
             win.lift()
             win.focus_force()
             return
-        self._sv_preview_win = StackVideoPreview(self, self._get_preview_params)
+        if not self._src_dir:
+            messagebox.showwarning("Dossier manquant",
+                                   "Veuillez d'abord sélectionner un répertoire source.")
+            return
+        # The preview is about the stack video: switch that mode on, so the
+        # settings panel is editable and « Générer » produces what is previewed.
+        if not (self._use_align_stack.get() and self._align_is_video()):
+            self._use_align_stack.set(True)
+            self._align_out_var.set("Vidéo de progression du stack (.mp4)")
+            self._toggle_align_stack()
+        try:
+            self._sv_preview_win = StackVideoPreview(self, self._get_preview_params)
+        except Exception as exc:
+            messagebox.showerror("Aperçu impossible",
+                                 f"{exc}\n\n{traceback.format_exc()}")
+
+    def _sv_ghs_from_auto(self, beta: float):
+        """GHS curve identical to the current auto stretch: SP = 0, b = 0, D = β."""
+        self._sv_ghs_SP.set(0.0)
+        self._sv_ghs_D.set(int(round(min(500.0, max(0.0, beta)))))
+        self._sv_ghs_b.set(0.0)
+        self._sv_ghs_LP.set(0.0)
+        self._sv_ghs_HP.set(1.0)
+        self._sv_stretch_var.set("GHS manuel")
+        self._toggle_align_stack()
 
     def _notify_sv_preview(self, stack: bool):
         win = self._sv_preview_win
@@ -4252,6 +4467,11 @@ class AllSkyApp(ctk.CTk):
             sv_counter        = self._sv_counter.get(),
             sv_max_width      = (0 if self._sv_max_width_var.get() == "Native"
                                  else int(self._sv_max_width_var.get())),
+            sv_stretch        = ("ghs" if self._sv_stretch_var.get() == "GHS manuel"
+                                 else "auto"),
+            sv_ghs            = dict(SP=self._sv_ghs_SP.get(), D=self._sv_ghs_D.get(),
+                                     b=self._sv_ghs_b.get(), LP=self._sv_ghs_LP.get(),
+                                     HP=self._sv_ghs_HP.get()),
         )
 
     def _start_processing(self):
