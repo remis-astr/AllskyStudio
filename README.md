@@ -11,6 +11,8 @@ caméra allsky [Multicam](https://github.com/remis-astr/Multicam) : images
 - **Filés d'étoiles** (star trails)
 - **Détection et filtrage des satellites** (transformée de Hough)
 - **Empilement avec alignement** sur les étoiles
+- **Vidéo de progression du stack** : image brute, puis 1, 2, … N images
+  empilées et traitées (pipeline Live Stack de Multicam), sur ~30 s
 - **Aperçu** du fond de ciel et du filtre satellites avant traitement
 
 ## Installation

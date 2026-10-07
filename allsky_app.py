@@ -10,6 +10,7 @@ Dependencies:
 import os
 import glob
 import threading
+import time
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -38,11 +39,15 @@ _PREFETCH       = _N_IO_WORKERS * 2                    # sliding-window buffer s
 _N_DET_WORKERS  = max(1, (os.cpu_count() or 4) // 2)  # CPU workers for Dg (median)
 # GPU morpho runs in a single dedicated thread — no contention, continuous GPU load
 
+# OpenCV names Bayer conversions after the 2×2 block starting at pixel (1, 1),
+# not (0, 0): a FITS BAYERPAT "BGGR" sensor needs COLOR_BAYER_RG2BGR (checked
+# against a Siril debayer of an IMX477 frame — the same-named constants swap
+# red and blue).
 _BAYER_MAP = {
-    "RGGB": cv2.COLOR_BAYER_RG2BGR,
-    "BGGR": cv2.COLOR_BAYER_BG2BGR,
-    "GRBG": cv2.COLOR_BAYER_GR2BGR,
-    "GBRG": cv2.COLOR_BAYER_GB2BGR,
+    "RGGB": cv2.COLOR_BAYER_BG2BGR,
+    "BGGR": cv2.COLOR_BAYER_RG2BGR,
+    "GRBG": cv2.COLOR_BAYER_GB2BGR,
+    "GBRG": cv2.COLOR_BAYER_GR2BGR,
 }
 
 ctk.set_appearance_mode("dark")
@@ -1045,25 +1050,23 @@ def _detect_stars(gray_f32: np.ndarray, mask_u8: "np.ndarray | None",
     if n_labels <= 1:
         return np.zeros((0, 2), np.float32)
 
-    candidates = []
-    for lbl in range(1, n_labels):
-        area = stats[lbl, cv2.CC_STAT_AREA]
-        if area < min_area or area > max_area:
-            continue
-        bw = stats[lbl, cv2.CC_STAT_WIDTH]
-        bh = stats[lbl, cv2.CC_STAT_HEIGHT]
-        if max(bw, bh) / max(1, min(bw, bh)) > max_aspect:
-            continue   # elongated -> satellite/plane streak, not a star
-        ys, xs = np.where(labels == lbl)
-        flux = float(resid[ys, xs].max())
-        cx, cy = centroids[lbl]
-        candidates.append((flux, cx, cy))
+    # Peak flux per component in one pass over the (sparse) detected pixels —
+    # a per-label np.where(labels == lbl) is O(K·H·W), seconds on 1080p.
+    on = binary > 0
+    peak = np.full(n_labels, -np.inf, np.float32)
+    np.maximum.at(peak, labels[on], resid[on])
 
-    if not candidates:
+    area = stats[1:, cv2.CC_STAT_AREA]
+    bw = stats[1:, cv2.CC_STAT_WIDTH]
+    bh = stats[1:, cv2.CC_STAT_HEIGHT]
+    aspect = np.maximum(bw, bh) / np.maximum(1, np.minimum(bw, bh))
+    # elongated -> satellite/plane streak, not a star
+    keep = (area >= min_area) & (area <= max_area) & (aspect <= max_aspect)
+    lbls = np.nonzero(keep)[0] + 1
+    if lbls.size == 0:
         return np.zeros((0, 2), np.float32)
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    candidates = candidates[:max_stars]
-    return np.array([[cx, cy] for _, cx, cy in candidates], dtype=np.float32)
+    order = np.argsort(-peak[lbls], kind="stable")[:max_stars]
+    return centroids[lbls[order]].astype(np.float32)
 
 
 def _star_signatures(stars: np.ndarray, k: int = 4) -> np.ndarray:
@@ -1341,6 +1344,969 @@ def process_stack_align(params: dict, progress_cb, done_cb, error_cb):
         cv2.imwrite(png_path, final_u8)
         done_cb(png_path, f"{used} / {n_use} images alignées avec succès.")
 
+    except Exception as exc:
+        error_cb(f"{exc}\n\n{traceback.format_exc()}")
+
+
+# ─── Stack Video — progressive live stack (port of Multicam's Live Stack) ────
+#
+# Video frame 0 = raw image, frame 1 = 1 image through the pipeline, frame k =
+# k images stacked + pipeline … up to N. The per-frame pipeline mirrors
+# Multicam's dso_stacker.js (hot pixels, star registration, background
+# normalisation, noise weighting, running σ-clipping) and auto_stretch.js
+# (colour-preserving arcsinh auto-stretch, local contrast, green removal),
+# adapted to a fixed AllSky rig: aligned sky + frozen ground, as in
+# process_stack_align.
+
+_AS_SHADOWS_CLIP = -2.8    # black point = median − 2.8 σ
+_AS_TARGET_MIN   = 0.10    # background level at the first (noisy) render
+_AS_TARGET_MAX   = 0.18    # background level once noise is divided by 5 (~25 images)
+_AS_RAMP_IMAGES  = 25
+_AS_LCE_RADIUS   = 1 / 40  # local-contrast radius / largest dimension
+_AS_SMOOTHING    = 0.5     # weight of the new render in the stats smoothing
+_AS_LUT_N        = 65536   # entries of the stretch-curve table
+
+
+def _srgb_to_linear_lut() -> np.ndarray:
+    x = np.arange(256, dtype=np.float64) / 255.0
+    lin = np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+    return (lin * 255.0).astype(np.float32)
+
+
+_SRGB_LIN_LUT = _srgb_to_linear_lut()
+
+# Reductions over a size-3 last axis (img.max(axis=2), .mean(axis=2)) are ~10×
+# slower than elementwise ops in NumPy — these helpers stay elementwise.
+_LUMA_MEAN = np.float32([[1 / 3, 1 / 3, 1 / 3]])
+
+
+def _max3(img: np.ndarray) -> np.ndarray:
+    return np.maximum(np.maximum(img[:, :, 0], img[:, :, 1]), img[:, :, 2])
+
+
+def _min3(img: np.ndarray) -> np.ndarray:
+    return np.minimum(np.minimum(img[:, :, 0], img[:, :, 1]), img[:, :, 2])
+
+
+def _remove_hot_pixels(frame: np.ndarray, k: float = 6.0) -> np.ndarray:
+    """
+    Replace isolated hot/dead pixels by their 3×3 median. A pixel is hot when
+    it sticks out of its median by k·σ AND that median itself sits on the
+    local background: a star core's neighbours stay bright, which raises its
+    3×3 median, so stars are spared (same idea as Multicam's hotPixelsCPU).
+    """
+    med = cv2.medianBlur(frame, 3)
+    resid = cv2.absdiff(frame, med)
+    s = max(1.4826 * float(np.median(resid[::7, ::7])), 0.05)
+    bad = resid > k * s
+    del resid
+    local = cv2.blur(med, (15, 15))
+    np.subtract(med, local, out=local)              # height above local background
+    bad &= local < 2.0 * s
+    del local
+    np.copyto(frame, med, where=bad)               # in place: frames are large
+    return frame
+
+
+def _load_fits_float(path: str, bayer_code, p_lo: float, p_hi: float):
+    """
+    FITS → float32 BGR on the global linear scale (p_lo → 0, p_hi → 255)
+    WITHOUT clipping, debayered at full 16-bit precision. The other modes go
+    through uint8 before debayering and clip at p_hi, which saturates every
+    star and galaxy core of deep-sky data (e.g. IMX477 12-bit: sky ~280 ADU,
+    p99.5 ~330 ADU, stars up to 4095). With no Bayer pattern chosen in the
+    UI, the header's BAYERPAT is used for 2-D frames.
+    """
+    try:
+        from astropy.io import fits as _fits
+        with _fits.open(path, memmap=False) as hdul:
+            hdu = hdul[0]
+            if hdu.data is None:
+                hdu = next((x for x in hdul[1:] if x.data is not None and x.data.ndim >= 2), None)
+                if hdu is None:
+                    return None
+            data = np.asarray(hdu.data)
+            pat = str(hdu.header.get("BAYERPAT", "")).strip().upper()
+        scale = np.float32(255.0 / (p_hi - p_lo))
+        if data.ndim == 2:
+            code = bayer_code if bayer_code is not None else _BAYER_MAP.get(pat)
+            if code is not None:
+                raw = np.clip(data, 0, 65535).astype(np.uint16)
+                bgr = cv2.cvtColor(raw, code).astype(np.float32)
+            else:
+                g = data.astype(np.float32)
+                bgr = np.stack([g, g, g], axis=2)
+        elif data.ndim == 3:
+            arr = data.astype(np.float32)
+            if arr.shape[0] in (1, 3) and arr.shape[0] < arr.shape[1] // 2:
+                arr = arr.transpose(1, 2, 0)
+            if arr.shape[2] == 3:
+                bgr = np.ascontiguousarray(arr[:, :, ::-1])
+            else:
+                g = arr[:, :, 0]
+                bgr = np.stack([g, g, g], axis=2)
+        else:
+            return None
+        bgr -= np.float32(p_lo)
+        bgr *= scale
+        return bgr
+    except Exception:
+        return None
+
+
+def _load_stack_frame(args: tuple):
+    """
+    Worker-side loading for process_stack_video: linear float32 BGR frame
+    (sRGB JPEG/PNG optionally linearised), hot pixels removed (at full
+    resolution), downscaled to the working size if smaller, stars detected.
+    Returns (None, None) for an unreadable image or one whose size differs
+    from the reference — it is skipped, not replaced.
+    Also returns the sensor-clipping map (None if no clipping level): it must
+    be found at full resolution — downscaling averages a clipped star core
+    below any threshold.
+    args = (path, (full_w, full_h), (work_w, work_h), bayer_code, p_lo, p_hi,
+            linearize, hot, mask_u8, k_sigma, sat_level)
+    """
+    (path, full_size, work_size, bayer_code, p_lo, p_hi,
+     linearize, hot, mask_u8, k_sigma, sat_level) = args
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.fit', '.fits'):
+        frame = _load_fits_float(path, bayer_code, p_lo, p_hi)
+    else:
+        img = cv2.imread(path)
+        if img is None:
+            frame = None
+        elif linearize:
+            frame = _SRGB_LIN_LUT[img]
+        else:
+            frame = img.astype(np.float32)
+    if frame is None or (frame.shape[1], frame.shape[0]) != tuple(full_size):
+        return None, None, None
+    if hot:
+        frame = _remove_hot_pixels(frame)
+    clip = None
+    if sat_level:
+        # clipped in any channel, grown 2 px (debayering spreads it)
+        clip = (_max3(frame) >= 0.98 * sat_level).astype(np.float32)
+        clip = cv2.dilate(clip, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    if tuple(work_size) != tuple(full_size):
+        frame = cv2.resize(frame, tuple(work_size), interpolation=cv2.INTER_AREA)
+        if clip is not None:
+            clip = cv2.resize(clip, tuple(work_size), interpolation=cv2.INTER_AREA)
+    gray = cv2.transform(frame, np.float32([[0.114, 0.587, 0.299]]))
+    stars = _detect_stars(gray, mask_u8, max_stars=150, k_sigma=k_sigma)
+    return frame, stars, clip
+
+
+def _background_map(frame: np.ndarray, mask_f32: "np.ndarray | None" = None,
+                    scale: int = 16) -> np.ndarray:
+    """
+    Large-scale background (stars removed by the median), full size. With a
+    mask, only masked pixels contribute (normalised convolution) and the map
+    is smoothly extrapolated outside: the bright ground must not leak into the
+    sky background, which is rotated with the sky afterwards.
+    """
+    h, w = frame.shape[:2]
+    size = (max(4, w // scale), max(4, h // scale))
+    if mask_f32 is None:
+        small = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+    else:
+        num = cv2.resize(frame * mask_f32[:, :, None], size, interpolation=cv2.INTER_AREA)
+        den = cv2.resize(mask_f32, size, interpolation=cv2.INTER_AREA)
+        good = (den > 0.5).astype(np.float32)
+        small = num / np.maximum(den, 1e-6)[:, :, None] * good[:, :, None]
+        sig = max(size) / 8.0
+        fill = (cv2.GaussianBlur(small, (0, 0), sig)
+                / np.maximum(cv2.GaussianBlur(good, (0, 0), sig), 1e-6)[:, :, None])
+        small = np.where(good[:, :, None] > 0, small, fill).astype(np.float32)
+    small = cv2.medianBlur(small, 5)
+    small = cv2.GaussianBlur(small, (0, 0), 2.0)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _frame_noise(frame: np.ndarray, bg: np.ndarray, mask: np.ndarray) -> float:
+    """Robust σ (1.4826·MAD) of the background-subtracted luminance in the sky."""
+    resid = cv2.transform(frame[::5, ::5] - bg[::5, ::5], _LUMA_MEAN)
+    vals = resid[mask[::5, ::5]]
+    if vals.size == 0:
+        return 1.0
+    med = float(np.median(vals))
+    return max(1.4826 * float(np.median(np.abs(vals - med))), 1e-4)
+
+
+class _ClipStack:
+    """
+    Running weighted mean + variance per pixel and per channel (weighted
+    Welford), with streaming σ-rejection once `min_frames` samples are in:
+    a value more than κ·σ above (satellite, plane, cosmic) or κ_low·σ below
+    the running mean is not stacked. The tolerance includes a share of the
+    signal, σ² + (β·signal)², so star wings of a softer frame survive.
+    The tolerance moves slowly, so it is only refreshed every `tol_every`
+    images (this runs on full-resolution 3-channel arrays at every image).
+    """
+
+    def __init__(self, shape, kappa: float, kappa_low: float = 5.0,
+                 min_frames: int = 10, signal_tol: float = 0.15, tol_every: int = 4):
+        self.mean = np.zeros(shape, np.float32)
+        self.S    = np.zeros(shape, np.float32)
+        self.W    = np.zeros(shape, np.float32)
+        self.n    = np.zeros(shape, np.float32)
+        self.kappa, self.kappa_low = kappa, kappa_low
+        self.min_frames, self.signal_tol = min_frames, signal_tol
+        self.tol_every = tol_every
+        self.frames = 0          # upper bound of n
+        self._hi = self._lo = self._young = None
+        self.track_rejects = False   # add() returns the rejected fraction (preview)
+
+    def _refresh_tolerance(self, bg: np.ndarray) -> None:
+        sig2 = self.S / np.maximum(self.W, 1e-12)
+        sig2 *= self.n / np.maximum(self.n - 1.0, 1.0)
+        sgn = np.maximum(self.mean - bg, 0.0)
+        sgn *= self.signal_tol
+        sgn *= sgn
+        sig2 += sgn
+        np.sqrt(sig2, out=sig2)
+        self._hi = sig2 * self.kappa
+        sig2 *= -self.kappa_low
+        self._lo = sig2
+        self._young = self.n < self.min_frames     # too few samples to judge
+
+    def add(self, x: np.ndarray, weight: float, valid: "np.ndarray | None",
+            bg: np.ndarray) -> "float | None":
+        self.frames += 1
+        delta = x - self.mean
+        acc = None
+        rejected = None
+        if self.kappa > 0 and self.frames > self.min_frames:
+            if self._hi is None or (self.frames - self.min_frames - 1) % self.tol_every == 0:
+                self._refresh_tolerance(bg)
+            acc = (delta <= self._hi) & (delta >= self._lo)
+            acc |= self._young
+            if valid is not None:
+                acc &= valid
+            if self.track_rejects:
+                n_cand = (3 * int(valid.sum())) if valid is not None else acc.size
+                rejected = 1.0 - int(acc.sum()) / max(1, n_cand)
+        elif valid is not None:
+            acc = np.broadcast_to(valid, x.shape)
+        if acc is None:
+            w = np.full(x.shape, weight, np.float32)
+            self.n += 1.0
+        else:
+            w = acc.astype(np.float32)
+            self.n += w
+            w *= weight
+        self.W += w
+        r = w / np.maximum(self.W, 1e-12)              # w = 0 wherever W = 0
+        r *= delta
+        self.mean += r
+        w *= delta
+        w *= x - self.mean
+        self.S += w
+        return rejected
+
+
+class _MeanStack:
+    """Plain weighted running mean — the frozen ground (camera never moves)."""
+
+    def __init__(self, shape):
+        self.sum = np.zeros(shape, np.float32)
+        self.W = 0.0
+
+    def add(self, x: np.ndarray, weight: float) -> None:
+        self.sum += x * np.float32(weight)
+        self.W += weight
+
+    @property
+    def mean(self) -> np.ndarray:
+        return self.sum * np.float32(1.0 / max(self.W, 1e-12))
+
+
+def _measure_auto_stretch(img: np.ndarray, valid: np.ndarray) -> "dict | None":
+    """Port of measureAutoStretch (auto_stretch.js). img: float BGR."""
+    pix = img[::2, ::2][valid[::2, ::2]][:, ::-1].astype(np.float64)   # (n, 3) RGB, 1/4
+    if pix.shape[0] < 64:
+        return None
+    smp = pix[::4]                                                       # 1/16
+    med = np.median(smp, axis=0)
+    sigma = 1.4826 * np.median(np.abs(smp - med), axis=0)
+    mx = smp.max(axis=0)
+
+    gains = np.ones(3)
+    s4 = pix
+    d = s4 - med
+    sel = (np.all(d >= 10 * sigma, axis=1)
+           & (s4.max(axis=1) <= 0.9 * float(mx.max())))
+    if int(sel.sum()) > 100:
+        sm = d[sel].sum(axis=0)
+        if sm[0] > 0 and sm[2] > 0:
+            gains = np.clip(np.array([sm[1] / sm[0], 1.0, sm[1] / sm[2]]), 0.25, 4.0)
+
+    sig_mean = float((sigma * gains).mean())
+    c0 = med + _AS_SHADOWS_CLIP * sig_mean
+    bg = -_AS_SHADOWS_CLIP * sig_mean
+    lum = smp.mean(axis=1)
+    top = float(np.quantile(lum, 0.99995))
+    white = max((top - float(med.mean())) * float(gains.mean()) + bg, bg * 4, 1e-6)
+    return dict(med=med, gains=gains, c0=c0, bg=bg, white=white, sigma=sig_mean)
+
+
+def _beta_for(x: float, t: float) -> float:
+    """β such that asinh(β·x)/asinh(β) = t (log-scale bisection)."""
+    if not (x > 0) or x >= t:
+        return 1e-3
+    a, b = 1e-3, 1e8
+    for _ in range(70):
+        c = float(np.sqrt(a * b))
+        if np.arcsinh(c * x) / np.arcsinh(c) < t:
+            a = c
+        else:
+            b = c
+    return float(np.sqrt(a * b))
+
+
+def _auto_stretch_params(img: np.ndarray, valid: np.ndarray, state: dict,
+                         target: "float | None", count: int) -> "dict | None":
+    """Port of autoStretchParams: stats smoothed from one render to the next."""
+    m = _measure_auto_stretch(img, valid)
+    if m is None:
+        return state.get("stats")
+    p = state.get("stats")
+    if p is not None:
+        a = _AS_SMOOTHING
+        for k in ("bg", "white", "sigma", "med", "gains", "c0"):
+            m[k] = a * m[k] + (1 - a) * p[k]
+    if state.get("sigma_ref") is None:
+        state["sigma_ref"] = m["sigma"]
+        state["n_ref"] = max(1, count)
+    n_eff = state["n_ref"] * (state["sigma_ref"] / max(m["sigma"], 1e-12)) ** 2
+    state["stats"] = m
+    t = target
+    if t is None:
+        r = min(1.0, max(0.0, np.log(max(1.0, n_eff)) / np.log(_AS_RAMP_IMAGES)))
+        t = _AS_TARGET_MIN + (_AS_TARGET_MAX - _AS_TARGET_MIN) * r
+    return dict(m, beta=_beta_for(m["bg"] / m["white"], t), target=t, n_eff=n_eff)
+
+
+def _auto_stretch_render(img: np.ndarray, valid: np.ndarray, p: dict,
+                         local_contrast: float = 0.0,
+                         clip: "np.ndarray | None" = None) -> np.ndarray:
+    """
+    Port of autoStretchRender: colour-preserving arcsinh (Lupton 2004) — the
+    curve is computed on the luminance and R, G, B are scaled by the same
+    factor, so hues survive. Optional large-scale local contrast. → uint8 BGR.
+    clip (0–1 map, see _LiveStacker): where the sensor clipped, the white
+    balance is faded to a neutral gain — otherwise the equal clipped channels
+    times the WB gains (×1.8 on R and B for a raw IMX477) turn star cores
+    magenta/blue.
+    """
+    h, w = img.shape[:2]
+    med   = p["med"][::-1].astype(np.float32)          # RGB → BGR
+    gains = p["gains"][::-1].astype(np.float32)
+    c0    = p["c0"][::-1].astype(np.float32)
+    beta  = p["beta"]
+    inv = np.float32(1.0 / p["white"])
+    # v = ((img − med)·gains + med − c0) / white, as one affine per channel
+    v = img * (gains * inv) + (med - c0 - med * gains) * inv
+    if clip is not None:
+        t = np.minimum(clip * 3.0, 1.0)
+        t = cv2.GaussianBlur(t, (0, 0), 1.0)[:, :, None]
+        g_n = np.float32(gains.mean())
+        v_n = img * (g_n * inv) + (med - c0 - med * g_n) * inv
+        v_n -= v
+        v_n *= t
+        v += v_n
+    I = cv2.transform(v, _LUMA_MEAN)
+    Ig = cv2.blur(I, (3, 3), borderType=cv2.BORDER_REPLICATE)   # no chroma noise
+    ab = float(np.arcsinh(beta))
+    # f(x) = asinh(βx)/asinh(β): table on [0, 1] (as in auto_stretch.js), exact above
+    lut = (np.arcsinh(beta * np.linspace(0.0, 1.0, _AS_LUT_N)) / ab).astype(np.float32)
+    idx = np.clip(Ig * (_AS_LUT_N - 1) + 0.5, 0, _AS_LUT_N - 1).astype(np.int32)
+    fI = lut[idx]
+    fI[Ig <= 0] = 0.0
+    over = Ig >= 1.0
+    if over.any():
+        fI[over] = np.arcsinh(beta * Ig[over]) / ab
+    if local_contrast > 0:
+        F = 4
+        sw, sh = -(-w // F), -(-h // F)
+        small = cv2.resize(fI, (sw, sh), interpolation=cv2.INTER_AREA)
+        r = max(1, round(max(w, h) * _AS_LCE_RADIUS / F))
+        for _ in range(3):                                         # ≈ gaussian
+            small = cv2.blur(small, (2 * r + 1, 2 * r + 1), borderType=cv2.BORDER_REPLICATE)
+        blur = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+        fI = np.maximum(0.0, fI + local_contrast * (fI - blur) * (1.0 - np.minimum(fI, 1.0)))
+    k = np.where(Ig > 1e-7, fI / np.maximum(Ig, 1e-7), beta / ab).astype(np.float32)
+    out = v * k[:, :, None]
+    mx = _max3(out)
+    out *= (255.0 / np.maximum(mx, 1.0))[:, :, None]   # out of gamut: keep hue
+    np.clip(out, 0.0, 255.0, out=out)
+    out += 0.5
+    out[~valid] = 0
+    return out.astype(np.uint8)
+
+
+def _remove_green(img_u8: np.ndarray) -> np.ndarray:
+    """
+    Port of removeGreen8: average-neutral SCNR (G ≤ (R+B)/2) computed on local
+    means (image ÷4, blurred) and applied as a smooth factor, brightness
+    restored with the same smoothed factor.
+    """
+    h, w = img_u8.shape[:2]
+    small = cv2.resize(img_u8.astype(np.float32), (-(-w // 4), -(-h // 4)),
+                       interpolation=cv2.INTER_AREA)
+    small = cv2.blur(small, (3, 3), borderType=cv2.BORDER_REPLICATE)
+    b, g, r = small[:, :, 0], small[:, :, 1], small[:, :, 2]
+    fG = np.where(g > 1e-3, np.minimum(1.0, (r + b) / np.maximum(2 * g, 1e-6)), 1.0)
+    den = r + fG * g + b
+    fL = np.where(den > 1e-3, (r + g + b) / np.maximum(den, 1e-6), 1.0)
+    fG = cv2.resize(fG.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    fL = cv2.resize(fL.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    out = img_u8.astype(np.float32)
+    out[:, :, 0] *= fL
+    out[:, :, 1] *= fG * fL
+    out[:, :, 2] *= fL
+    out *= (255.0 / np.maximum(_max3(out), 255.0))[:, :, None]   # keep hue
+    out = np.where((fG >= 0.999)[:, :, None], img_u8.astype(np.float32), out)
+    return (out + 0.5).astype(np.uint8)
+
+
+def _apply_saturation_clamped(img_u8: np.ndarray, sat: float) -> np.ndarray:
+    """Port of applySaturation (stacker.js): luminance kept, gain limited per pixel."""
+    if abs(sat - 1.0) < 1e-3:
+        return img_u8
+    f = img_u8.astype(np.float32)
+    y = cv2.transform(f, np.float32([[0.114, 0.587, 0.299]]))
+    d = f - y[:, :, None]
+    # largest gain keeping every channel inside [0, 255]
+    k = np.full(y.shape, sat, np.float32)
+    dmax, dmin = _max3(d), _min3(d)
+    np.minimum(k, np.where(dmax > 1e-6, (255.0 - y) / np.maximum(dmax, 1e-6), np.inf), out=k)
+    np.minimum(k, np.where(dmin < -1e-6, y / np.maximum(-dmin, 1e-6), np.inf), out=k)
+    d *= k[:, :, None]
+    d += y[:, :, None]
+    d += 0.5
+    return np.clip(d, 0, 255).astype(np.uint8)
+
+
+def _draw_counter(img_u8: np.ndarray, text: str) -> None:
+    h = img_u8.shape[0]
+    scale = max(0.5, h / 1080.0 * 1.1)
+    thick = max(1, int(round(scale * 2)))
+    org = (int(20 * scale), h - int(24 * scale))
+    shadow = (org[0] + thick, org[1] + thick)
+    cv2.putText(img_u8, text, shadow, cv2.FONT_HERSHEY_SIMPLEX, scale,
+                (0, 0, 0), thick, cv2.LINE_AA)
+    cv2.putText(img_u8, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale,
+                (235, 235, 235), thick, cv2.LINE_AA)
+
+
+def _stack_video_schedule(n_imgs: int, n_frames: int, progression: str) -> list:
+    """
+    Stack count shown by each video frame: frame 0 = raw (0), then 1 … n_imgs,
+    spread over n_frames. Fewer images than frames → each state is held
+    several frames; more → intermediate states are skipped (still stacked).
+    'log' gives more time to the first images, where the image changes most.
+    """
+    n_frames = max(3, n_frames)
+    counts = [0]
+    for j in range(1, n_frames):
+        t = (j - 1) / (n_frames - 2)
+        if progression == "log":
+            c = int(round(n_imgs ** t))
+        else:
+            c = 1 + int(round(t * (n_imgs - 1)))
+        counts.append(min(n_imgs, max(counts[-1], c, 1)))
+    counts[-1] = n_imgs
+    return counts
+
+
+def _sensor_saturation_level(path: str, p_lo: float, p_hi: float,
+                             linearize: bool) -> "float | None":
+    """
+    Sensor clipping level in stack units (same scale as _load_stack_frame),
+    or None if the first frame shows no clipping. 8-bit images: 255. FITS:
+    the frame's maximum ADU, if enough pixels sit on it (a 12-bit IMX477 in a
+    uint16 FITS clips at 4095, not 65535).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in ('.fit', '.fits'):
+        return float(_SRGB_LIN_LUT[255]) if linearize else 255.0
+    try:
+        from astropy.io import fits as _fits
+        with _fits.open(path, memmap=False) as hdul:
+            data = next((x.data for x in hdul if x.data is not None and x.data.ndim >= 2), None)
+        if data is None:
+            return None
+        top = float(data.max())
+        if int((data >= top).sum()) < 10:
+            return None
+        return (top - p_lo) * 255.0 / (p_hi - p_lo)
+    except Exception:
+        return None
+
+
+def _stack_snapshot(sky: "_ClipStack", grnd: "_MeanStack | None",
+                    alpha: np.ndarray) -> np.ndarray:
+    """Current stack as a new array: aligned sky feathered into frozen ground."""
+    if grnd is None:
+        return sky.mean.copy()        # uncovered pixels: W = 0 → mean = 0 (black)
+    g_mean = grnd.mean
+    sky_img = np.where(sky.W > 0, sky.mean, g_mean)
+    return alpha * sky_img + (1.0 - alpha) * g_mean
+
+
+class _StackVideoError(Exception):
+    """User-facing error of the stack-video pipeline (message shown as is)."""
+
+
+def _stack_video_config(params: dict) -> dict:
+    """Stack-video settings from the UI params (shared by the run and the preview)."""
+    return dict(
+        bayer_code    = params.get("bayer_code", None),
+        mask_rad      = float(params["align_mask_radius"]),
+        ground_cutoff = float(params.get("align_ground_cutoff", 0.0)),
+        k_sigma       = float(params["align_k_sigma"]),
+        target        = params["sv_target"],                # None = auto
+        lce           = float(params["sv_local_contrast"]),
+        rm_green      = bool(params["sv_remove_green"]),
+        saturation    = float(params["sv_saturation"]),
+        kappa         = float(params["sv_kappa"]),          # 0 = no σ-rejection
+        linearize     = bool(params["sv_linearize"]),
+        hot           = bool(params["sv_hot_pixels"]),
+        bg_norm       = bool(params["sv_bg_norm"]),
+        weighting     = bool(params["sv_weighting"]),
+    )
+
+
+def _stack_video_paths(params: dict, n_max: int) -> list:
+    """Sorted images of src_dir from the reference image on, at most n_max."""
+    src_dir = params["src_dir"]
+    exts = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG",
+            "*.fit", "*.fits", "*.FIT", "*.FITS")
+    paths: list = []
+    for e in exts:
+        paths.extend(glob.glob(os.path.join(src_dir, e)))
+    paths.sort()
+    if not paths:
+        raise _StackVideoError("Aucune image trouvée dans le répertoire sélectionné.")
+    start_idx = 0
+    ref_path = params.get("align_ref_path", "") or ""
+    if ref_path:
+        target_p = os.path.normcase(os.path.abspath(ref_path))
+        for i, p in enumerate(paths):
+            if os.path.normcase(os.path.abspath(p)) == target_p:
+                start_idx = i
+                break
+    if len(paths) - start_idx < 2:
+        raise _StackVideoError("Pas assez d'images après l'image de référence pour "
+                               "l'empilement (minimum 2 requis).")
+    return paths[start_idx:start_idx + max(2, n_max)]
+
+
+def _image_size(path: str) -> "tuple | None":
+    """(w, h) from the file header only — no pixel decoding."""
+    try:
+        if os.path.splitext(path)[1].lower() in ('.fit', '.fits'):
+            from astropy.io import fits as _fits
+            hd = _fits.getheader(path)
+            if hd.get("NAXIS", 0) < 2:
+                hd = _fits.getheader(path, 1)
+            n1, n2, n3 = hd.get("NAXIS1"), hd.get("NAXIS2"), hd.get("NAXIS3")
+            # (C, H, W) colour FITS: NAXIS1 = W, NAXIS2 = H; (H, W, C): NAXIS1 = C
+            if n1 in (1, 3) and n3 and n3 > 3:
+                return (n2, n3)
+            return (n1, n2)
+        with _PILImage.open(path) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def _sequence_warnings(seq_paths: list, sample: int = 24) -> list:
+    """Mixed formats / image sizes in the sequence (e.g. raw + processed FITS)."""
+    warns = []
+    exts = sorted({os.path.splitext(p)[1].lower() for p in seq_paths})
+    if len(exts) > 1:
+        warns.append("Formats mélangés dans la séquence : " + ", ".join(exts)
+                     + " — vérifier que le dossier ne contient que les images brutes.")
+    step = max(1, len(seq_paths) // sample)
+    sizes: dict = {}
+    for p in seq_paths[::step]:
+        sizes.setdefault(_image_size(p), []).append(os.path.basename(p))
+    sizes.pop(None, None)
+    if len(sizes) > 1:
+        desc = "; ".join(f"{s[0]}×{s[1]} ({len(v)}, ex. {v[0]})" for s, v in sizes.items())
+        warns.append("Tailles d'image différentes : " + desc
+                     + " — les images d'une autre taille que la référence seront ignorées.")
+    return warns
+
+
+class _StackGeometry:
+    """Sky/ground mask + feathered alpha (same geometry as Stack & Align)."""
+
+    def __init__(self, h: int, w: int, mask_rad: float, ground_cutoff: float):
+        self.h, self.w = h, w
+        half_diag = 0.5 * float(np.hypot(h, w))
+        self.radius = int(mask_rad * half_diag)
+        self.cutoff_row = (int(h * (1.0 - min(ground_cutoff, 0.9)))
+                           if ground_cutoff > 0.0 else None)
+        m = np.zeros((h, w), np.uint8)
+        cv2.circle(m, (w // 2, h // 2), self.radius, 255, -1)
+        if self.cutoff_row is not None:
+            m[self.cutoff_row:, :] = 0
+        self.sky_mask_u8 = m
+        self.sky_mask = m > 0
+        self.mask_f32 = m.astype(np.float32) / 255.0
+        self.alpha = cv2.GaussianBlur(self.mask_f32, (0, 0),
+                                      max(3.0, self.radius * 0.02))[:, :, None]
+        # Sky covers the whole frame (deep sky, or mask ≥ the corners): no
+        # frozen-ground track needed — saves a full-size accumulator.
+        self.use_ground = bool(self.alpha.min() < 0.999)
+
+    def sky_mask_at(self, w: int, h: int) -> np.ndarray:
+        if (w, h) == (self.w, self.h):
+            return self.sky_mask
+        return cv2.resize(self.sky_mask_u8, (w, h), interpolation=cv2.INTER_NEAREST) > 0
+
+    def draw_overlay(self, img_u8: np.ndarray) -> np.ndarray:
+        """Sky/ground boundary drawn on a (possibly resized) copy."""
+        out = img_u8.copy()
+        ih, iw = out.shape[:2]
+        sx, sy = iw / self.w, ih / self.h
+        th = max(1, int(round(2 * max(iw, ih) / 1000)))
+        cv2.ellipse(out, (int(iw / 2), int(ih / 2)),
+                    (int(self.radius * sx), int(self.radius * sy)),
+                    0, 0, 360, (0, 200, 255), th, cv2.LINE_AA)
+        if self.cutoff_row is not None:
+            y = int(self.cutoff_row * sy)
+            cv2.line(out, (0, y), (iw, y), (0, 200, 255), th, cv2.LINE_AA)
+        return out
+
+
+def _prepare_stack_sequence(seq_paths: list, cfg: dict,
+                            work_width: int = 0) -> dict:
+    """
+    Global FITS scale, raw first frame, processing size and geometry.
+    work_width > 0: frames are processed downscaled to that width (preview);
+    the mask geometry is relative, so it matches the full-size run.
+    """
+    bayer_code = cfg["bayer_code"]
+    p_lo, p_hi = compute_global_scale(seq_paths, bayer_code=bayer_code)
+    raw_u8 = None
+    for p in seq_paths:
+        ext = os.path.splitext(p)[1].lower()
+        # FITS: the p0.5–p99.5 linear scale shown as is = the raw frame
+        img = (_load_fits_float(p, bayer_code, p_lo, p_hi)
+               if ext in ('.fit', '.fits') else cv2.imread(p))
+        if img is not None:
+            raw_u8 = np.clip(img, 0, 255).astype(np.uint8)
+            break
+    if raw_u8 is None:
+        raise _StackVideoError("Impossible de lire la première image de la séquence.")
+    full_h, full_w = raw_u8.shape[:2]
+    if 0 < work_width < full_w:
+        w = work_width
+        h = max(2, int(round(full_h * w / full_w)))
+        raw_u8 = cv2.resize(raw_u8, (w, h), interpolation=cv2.INTER_AREA)
+    else:
+        h, w = full_h, full_w
+    return dict(
+        p_lo=p_lo, p_hi=p_hi, raw_u8=raw_u8, h=h, w=w, full_h=full_h, full_w=full_w,
+        sat_level=_sensor_saturation_level(seq_paths[0], p_lo, p_hi, cfg["linearize"]),
+        geom=_StackGeometry(h, w, cfg["mask_rad"], cfg["ground_cutoff"]),
+    )
+
+
+def _stack_load_args(seq_paths: list, cfg: dict, prep: dict) -> list:
+    full = (prep["full_w"], prep["full_h"])
+    work = (prep["w"], prep["h"])
+    return [(p, full, work, cfg["bayer_code"], prep["p_lo"], prep["p_hi"],
+             cfg["linearize"], cfg["hot"], prep["geom"].sky_mask_u8, cfg["k_sigma"],
+             prep["sat_level"])
+            for p in seq_paths]
+
+
+class _LiveStacker:
+    """
+    One image at a time: background normalisation, noise weighting, star
+    registration on the reference (first image), σ-clipped sky stack and
+    frozen-ground mean. add() returns per-image diagnostics.
+    """
+    MIN_INLIERS = 6
+
+    def __init__(self, prep: dict, cfg: dict, track_rejects: bool = False):
+        self.cfg, self.geom = cfg, prep["geom"]
+        h, w = prep["h"], prep["w"]
+        self.h, self.w = h, w
+        self.sky = _ClipStack((h, w, 3), cfg["kappa"])
+        self.sky.track_rejects = track_rejects
+        self.grnd = _MeanStack((h, w, 3)) if self.geom.use_ground else None
+        # Sensor clipping seen in any image, in the stack's geometry (sky
+        # warped, ground fixed) — the renderer neutralises colour there.
+        self.clip = np.zeros((h, w), np.float32) if prep["sat_level"] else None
+        self.ref_stars = self.ref_sig = self.bg_ref = self.bg_sky_ref = None
+        self.sigma_ref = 1.0
+        self.count = self.aligned = self.skipped = 0
+
+    def add(self, frame: "np.ndarray | None", stars,
+            clip: "np.ndarray | None" = None) -> dict:
+        self.count += 1
+        if frame is None:
+            self.skipped += 1
+            return dict(status="skipped")
+        geom, cfg, bg_norm = self.geom, self.cfg, self.cfg["bg_norm"]
+        first = self.ref_stars is None
+        bg = (_background_map(frame)
+              if self.grnd is not None and (bg_norm or first) else None)
+        bg_s = _background_map(frame, geom.mask_f32) if (bg_norm or first) else None
+        if first:
+            if len(stars) < self.MIN_INLIERS:
+                raise _StackVideoError(
+                    f"Pas assez d'étoiles détectées dans l'image de référence "
+                    f"({len(stars)} trouvées, {self.MIN_INLIERS} requises). "
+                    "Choisissez une autre référence ou baissez la sensibilité (k·σ).")
+            self.ref_stars, self.ref_sig = stars, _star_signatures(stars)
+            self.bg_ref, self.bg_sky_ref = bg, bg_s
+            self.sigma_ref = _frame_noise(frame, bg_s, geom.sky_mask)
+
+        weight = 1.0
+        if cfg["weighting"] and not first:
+            sig = _frame_noise(frame, bg_s if bg_s is not None else self.bg_sky_ref,
+                               geom.sky_mask)
+            weight = float(np.clip((self.sigma_ref / sig) ** 2, 0.1, 10.0))
+
+        # Background brought back to the reference (sensor space for the
+        # ground, then warped for the sky): a sky gradient that changes
+        # during the night is not taken for an outlier.
+        if self.grnd is not None:
+            self.grnd.add(frame - bg + self.bg_ref if bg_norm else frame, weight)
+        del bg
+
+        M, n_inl = None, 0
+        if first:
+            M, n_inl = np.float32([[1, 0, 0], [0, 1, 0]]), len(stars)
+        elif len(stars) >= self.MIN_INLIERS:
+            M, n_inl = _estimate_registration(self.ref_stars, self.ref_sig, stars,
+                                              _star_signatures(stars), self.MIN_INLIERS)
+        info = dict(status="aligned" if M is not None else "not_aligned",
+                    stars=len(stars), inliers=n_inl, weight=weight, rejected=None)
+        if M is not None:
+            h, w = self.h, self.w
+            if bg_norm:
+                frame -= bg_s                      # in place: not used after
+            warped = cv2.warpAffine(frame, M, (w, h), flags=cv2.INTER_LANCZOS4,
+                                    borderValue=0)
+            del frame
+            if bg_norm:
+                warped += self.bg_sky_ref
+            cov = cv2.warpAffine(np.ones((h, w), np.float32), M, (w, h),
+                                 flags=cv2.INTER_LINEAR, borderValue=0)
+            info["rejected"] = self.sky.add(warped, weight, (cov > 0.999)[:, :, None],
+                                            self.bg_sky_ref)
+            self.aligned += 1
+            if clip is not None and self.clip is not None:
+                wc = cv2.warpAffine(clip, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+                a = self.geom.alpha[:, :, 0]
+                np.maximum(self.clip, a * wc + (1.0 - a) * clip, out=self.clip)
+        return info
+
+    def snapshot(self) -> tuple:
+        """(stack image, clip map or None) — new arrays, safe to hand to a thread."""
+        return (_stack_snapshot(self.sky, self.grnd, self.geom.alpha),
+                None if self.clip is None else self.clip.copy())
+
+
+class _StackRenderer:
+    """Multicam Live Stack rendering of a stack snapshot → uint8 BGR."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.last_params: "dict | None" = None     # stretch of the last render
+
+    def render(self, snap: tuple, sky_m: np.ndarray, count: int,
+               state: dict) -> "np.ndarray | None":
+        final_f, clip = snap
+        cfg = self.cfg
+        fmax = _max3(final_f)
+        valid = fmax > 0.0
+        stats_mask = valid & sky_m & (fmax > 0.5)
+        if int(stats_mask.sum()) < 1000:
+            stats_mask = valid
+        p_st = _auto_stretch_params(final_f, stats_mask, state, cfg["target"], count)
+        self.last_params = p_st
+        if p_st is None:
+            return None
+        out = _auto_stretch_render(final_f, valid, p_st, cfg["lce"], clip)
+        if cfg["rm_green"]:
+            out = _remove_green(out)
+        return _apply_saturation_clamped(out, cfg["saturation"])
+
+
+def _stack_workers(h: int, w: int) -> tuple:
+    """
+    Bounded loading: a full-size float frame of an 8.7 MP sensor is ~105 MB,
+    and each loader thread holds ~5 such temporaries (hot pixels, star
+    detection) — the default 8 threads / 16-frame window would need several
+    GB. ~1 GB budget, at least 2 threads. → (n_workers, prefetch)
+    """
+    frame_bytes = h * w * 3 * 4
+    n_workers = int(max(2, min(_N_IO_WORKERS, 2**30 // (6 * frame_bytes))))
+    return n_workers, int(min(_PREFETCH, n_workers + 2))
+
+
+def _iter_stack_frames(load_args: list, n_workers: int, prefetch: int,
+                       cancelled=lambda: False):
+    """Yield (frame, stars, clip) in order, loaded ahead by a bounded thread pool."""
+    n = len(load_args)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        pending: dict = {}
+        next_submit = 0
+
+        def fill(up_to: int) -> None:
+            nonlocal next_submit
+            while next_submit < min(up_to, n):
+                pending[next_submit] = pool.submit(_load_stack_frame,
+                                                   load_args[next_submit])
+                next_submit += 1
+
+        fill(prefetch)
+        for i in range(n):
+            if cancelled():
+                for f in pending.values():
+                    f.cancel()
+                return
+            res = pending.pop(i).result()
+            fill(i + 1 + prefetch)
+            yield res
+
+
+def _stack_video_estimate(n_use: int, full_w: int, full_h: int, n_video: int,
+                          vw: int, vh: int, sec_per_mpx: float) -> dict:
+    """
+    Rough cost of a full run: stacking time scales with the sensor size
+    (sec_per_mpx measured by the preview), memory ≈ 0.3 GB + ~23 full-size
+    float frames (measured: 2.7 GB for 4056×2160, 0.9 GB for 1920×1080).
+    """
+    mpx = full_w * full_h / 1e6
+    frame_bytes = full_w * full_h * 3 * 4
+    return dict(seconds=n_use * mpx * sec_per_mpx,
+                mem_gb=0.3 + 23 * frame_bytes / 1e9,
+                n_video=n_video, video_size=(vw, vh))
+
+
+def process_stack_video(params: dict, progress_cb, done_cb, error_cb):
+    """
+    Progressive stack video: the sky is star-aligned (as in Stack & Align)
+    and stacked one image at a time; after each image the running stack goes
+    through the Multicam Live Stack rendering pipeline and is written to the
+    MP4 — the viewer watches the sky gain detail and lose noise.
+    """
+    try:
+        out_path    = params["out_path"]
+        fps         = int(params["fps"])
+        duration    = float(params["sv_duration"])
+        progression = params["sv_progression"]           # "linear" | "log"
+        counter     = bool(params["sv_counter"])
+        max_width   = int(params.get("sv_max_width", 1920))   # 0 = native
+
+        cfg = _stack_video_config(params)
+        seq_paths = _stack_video_paths(params, int(params["align_n"]))
+        n_use = len(seq_paths)
+        prep = _prepare_stack_sequence(seq_paths, cfg)
+        h, w, geom = prep["h"], prep["w"], prep["geom"]
+
+        # Video frame size (stacking and the final PNG stay at full size)
+        if 0 < max_width < w:
+            vw = max_width - max_width % 2
+            vh = int(round(h * vw / w)) // 2 * 2
+        else:
+            vw, vh = w, h
+        small_sky = geom.sky_mask_at(vw, vh)
+
+        # ── Video schedule + writer ────────────────────────────────────
+        n_frames = max(3, int(round(duration * fps)))
+        counts = _stack_video_schedule(n_use, n_frames, progression)
+        video_path = os.path.splitext(out_path)[0] + "_stackvideo.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(video_path, fourcc, fps, (vw, vh))
+        if not writer.isOpened():
+            error_cb(f"Impossible de créer la vidéo : {video_path}")
+            return
+
+        j = 0
+        first = (cv2.resize(prep["raw_u8"], (vw, vh), interpolation=cv2.INTER_AREA)
+                 if (vw, vh) != (w, h) else prep["raw_u8"].copy())
+        if counter:
+            _draw_counter(first, "Image brute")   # Hershey fonts: ASCII only
+        while j < len(counts) and counts[j] == 0:
+            writer.write(first)
+            j += 1
+
+        stacker = _LiveStacker(prep, cfg)
+        renderer = _StackRenderer(cfg)
+        stretch_state: dict = {}
+        last = {"u8": first}
+
+        def render_and_write(snap: tuple, count: int, n_rep: int) -> None:
+            # Runs on the single render thread: frames stay in order and
+            # rendering/encoding overlaps the stacking of the next image.
+            if (vw, vh) != (w, h):
+                snap = tuple(None if a is None else
+                             cv2.resize(a, (vw, vh), interpolation=cv2.INTER_AREA)
+                             for a in snap)
+            out = renderer.render(snap, small_sky, count, stretch_state)
+            if out is not None:
+                last["u8"] = out
+            frame_u8 = last["u8"].copy()
+            if counter:
+                _draw_counter(frame_u8, f"Stack : {count} image{'s' if count > 1 else ''}")
+            for _ in range(n_rep):
+                writer.write(frame_u8)
+
+        n_workers, prefetch = _stack_workers(h, w)
+        load_args = _stack_load_args(seq_paths, cfg, prep)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as render_pool:
+                render_fut = None
+                for frame, stars, clip in _iter_stack_frames(load_args, n_workers, prefetch):
+                    stacker.add(frame, stars, clip)
+                    del frame
+                    count = stacker.count
+                    if j < len(counts) and counts[j] == count:
+                        n_rep = 0
+                        while j < len(counts) and counts[j] == count:
+                            n_rep += 1
+                            j += 1
+                        # Snapshot (new array) of the stack, rendered in the background
+                        snap = stacker.snapshot()
+                        if render_fut is not None:
+                            render_fut.result()          # one render in flight at most
+                        render_fut = render_pool.submit(render_and_write, snap,
+                                                        count, n_rep)
+                    progress_cb(count, n_use)
+                if render_fut is not None:
+                    render_fut.result()
+        finally:
+            writer.release()
+
+        png_path = os.path.splitext(out_path)[0] + "_stackvideo_final.png"
+        if (vw, vh) != (w, h):
+            # Final image at full sensor resolution (the video is downscaled)
+            out = renderer.render(stacker.snapshot(), geom.sky_mask, n_use, {})
+            if out is not None:
+                last["u8"] = out
+        cv2.imwrite(png_path, last["u8"])
+        note = (f"{stacker.aligned} / {n_use} images alignées sur le ciel.\n"
+                f"{len(counts)} images vidéo à {fps} ips ({len(counts) / fps:.1f} s).\n"
+                f"Image finale : {png_path}")
+        if stacker.skipped:
+            note += (f"\n{stacker.skipped} image(s) ignorée(s) : illisibles ou d'une autre "
+                     "taille que la référence.")
+        done_cb(video_path, note)
+
+    except _StackVideoError as exc:
+        error_cb(str(exc))
     except Exception as exc:
         error_cb(f"{exc}\n\n{traceback.format_exc()}")
 
@@ -1781,6 +2747,394 @@ class PreviewWindow(ctk.CTkToplevel):
                 win.update_image(bgr)
 
 
+_SV_PREVIEW_WIDTH = 1000   # working width of the preview mini-stack (px)
+
+
+def _mem_available_gb() -> "float | None":
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1e6
+    except OSError:
+        pass
+    return None
+
+
+def _bgr_to_photo(bgr: np.ndarray, w: int, h: int):
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    pil = _PILImage.fromarray(rgb)
+    pil.thumbnail((w, h), _PILImage.LANCZOS)
+    if _HAS_PIL_TK:
+        return _PILImageTk.PhotoImage(pil)
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return _tk.PhotoImage(data=base64.b64encode(buf.getvalue()).decode())
+
+
+class StackVideoPreview(ctk.CTkToplevel):
+    """
+    Preview of the stack video before a long run: a mini-stack of the first
+    K images, downscaled to ~1000 px, through the very same components as
+    process_stack_video (_LiveStacker / _StackRenderer). Three panels:
+    raw | 1 image processed | K images stacked, plus diagnostics and a cost
+    estimate. Rendering settings re-render instantly from the cached stack
+    states; stacking settings recompute the mini-stack (debounced).
+    """
+
+    _W = 380
+    _H = 230
+
+    def __init__(self, master: ctk.CTk, get_params):
+        super().__init__(master)
+        self.title("Aperçu — Vidéo de progression du stack")
+        self.geometry(f"{self._W * 3 + 100}x{self._H + 420}")
+        self.resizable(True, True)
+        self._get_params = get_params
+        self._gen = 0                      # bumped at each recompute: stale threads stop
+        self._data: "dict | None" = None
+        self._imgs: dict = {"raw": None, "one": None, "k": None}
+        self._stack_job = self._render_job = self._resize_job = None
+        self._zoom_wins: dict = {"raw": None, "one": None, "k": None}
+        self._k_var = ctk.IntVar(value=20)
+        self._show_mask = ctk.BooleanVar(value=False)
+        self._build()
+        self.bind("<Configure>", self._on_window_resize)
+        self.lift()
+        self.focus_force()
+        self.after(150, self._start_stack)
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", padx=10, pady=(10, 2))
+        ctk.CTkLabel(bar, text="Images du mini-stack (K) :", anchor="w").pack(side="left")
+        k_lbl = ctk.CTkLabel(bar, text=str(self._k_var.get()), width=34)
+        ctk.CTkSlider(bar, from_=2, to=100, number_of_steps=98, width=200,
+                      variable=self._k_var,
+                      command=lambda v: (k_lbl.configure(text=str(int(round(v)))),
+                                         self.refresh_stack())).pack(side="left", padx=6)
+        k_lbl.pack(side="left")
+        ctk.CTkCheckBox(bar, text="Masque ciel/sol", variable=self._show_mask,
+                        command=self.refresh_render).pack(side="left", padx=14)
+        ctk.CTkButton(bar, text="Recalculer", width=110,
+                      command=self._start_stack).pack(side="right")
+
+        self._progress = ctk.CTkProgressBar(self)
+        self._progress.set(0.0)
+        self._progress.pack(fill="x", padx=12, pady=(4, 0))
+        self._lbl_status = ctk.CTkLabel(self, text="—", anchor="w")
+        self._lbl_status.pack(fill="x", padx=12)
+
+        panels = ctk.CTkFrame(self, fg_color="transparent")
+        panels.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self._panels = panels
+        self._titles: dict = {}
+        self._lbls: dict = {}
+        for key, title in (("raw", "Image brute"), ("one", "1 image traitée"),
+                           ("k", "K images empilées")):
+            col = ctk.CTkFrame(panels)
+            col.pack(side="left", fill="both", expand=True, padx=4)
+            t = ctk.CTkLabel(col, text=title, font=ctk.CTkFont(size=12, weight="bold"))
+            t.pack(pady=(8, 0))
+            ctk.CTkLabel(col, text="(cliquer pour agrandir)",
+                         font=ctk.CTkFont(size=10), text_color="gray60").pack(pady=(0, 2))
+            lbl = _tk.Label(col, background="#1a1a1a",
+                            width=self._W, height=self._H, cursor="hand2")
+            lbl.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+            lbl.bind("<Button-1>", lambda e, k=key: self._open_zoom(k))
+            self._titles[key], self._lbls[key] = t, lbl
+
+        self._diag = ctk.CTkTextbox(self, height=190, wrap="word",
+                                    font=ctk.CTkFont(family="monospace", size=12))
+        self._diag.pack(fill="x", padx=12, pady=(0, 10))
+        self._diag.configure(state="disabled")
+
+    # ── Public (called by the main window's variable traces) ─────────────────
+
+    def refresh_stack(self, *_):
+        """Stacking setting changed: recompute the mini-stack (debounced)."""
+        if self._stack_job:
+            self.after_cancel(self._stack_job)
+        self._stack_job = self.after(800, self._start_stack)
+
+    def refresh_render(self, *_):
+        """Rendering setting changed: re-render from the cached stack states."""
+        if self._data is None:
+            return
+        if self._render_job:
+            self.after_cancel(self._render_job)
+        self._render_job = self.after(120, self._render_panels)
+
+    # ── Mini-stack (background thread) ────────────────────────────────────────
+
+    def _start_stack(self):
+        self._stack_job = None
+        params = self._get_params()
+        if not params.get("src_dir"):
+            self._set_status("Sélectionnez d'abord un répertoire source.")
+            return
+        self._gen += 1
+        gen, k = self._gen, int(self._k_var.get())
+        self._progress.set(0.0)
+        self._set_status("Calcul du mini-stack…")
+        threading.Thread(target=self._compute, args=(params, gen, k), daemon=True).start()
+
+    def _post(self, gen: int, fn):
+        def run():
+            if gen == self._gen and self.winfo_exists():
+                fn()
+        try:
+            self.after(0, run)
+        except Exception:
+            pass          # window closed meanwhile
+
+    def _compute(self, params: dict, gen: int, k: int):
+        try:
+            cfg = _stack_video_config(params)
+            n_full = max(2, int(params["align_n"]))
+            seq_full = _stack_video_paths(params, n_full)
+            seq = seq_full[:max(2, min(k, len(seq_full)))]
+            warns = _sequence_warnings(seq_full)
+            prep = _prepare_stack_sequence(seq, cfg, work_width=_SV_PREVIEW_WIDTH)
+            stacker = _LiveStacker(prep, cfg, track_rejects=True)
+            n_workers, prefetch = _stack_workers(prep["full_h"], prep["full_w"])
+            load_args = _stack_load_args(seq, cfg, prep)
+            rows, snap1 = [], None
+            t0, t_stack = time.perf_counter(), 0.0
+            for frame, stars, clip in _iter_stack_frames(load_args, n_workers, prefetch,
+                                                         cancelled=lambda: gen != self._gen):
+                ta = time.perf_counter()
+                info = stacker.add(frame, stars, clip)
+                t_stack += time.perf_counter() - ta
+                del frame
+                info["name"] = os.path.basename(seq[stacker.count - 1])
+                rows.append(info)
+                if snap1 is None and info["status"] == "aligned":
+                    snap1 = stacker.snapshot()
+                c = stacker.count
+                self._post(gen, lambda c=c: (
+                    self._progress.set(c / len(seq)),
+                    self._set_status(f"Calcul du mini-stack… {c} / {len(seq)}")))
+            if gen != self._gen:
+                return
+            t_total = time.perf_counter() - t0
+            data = dict(cfg=cfg, prep=prep, seq=seq, n_full=len(seq_full),
+                        seq_first=seq_full[0], seq_last=seq_full[-1],
+                        rows=rows, warns=warns, snap1=snap1, snapk=stacker.snapshot(),
+                        k=stacker.count, aligned=stacker.aligned,
+                        skipped=stacker.skipped, ref_stars=len(stacker.ref_stars),
+                        t_total=t_total, t_stack=t_stack, n_workers=n_workers)
+            self._post(gen, lambda: self._on_stack_done(data))
+        except _StackVideoError as exc:
+            msg = str(exc)
+            self._post(gen, lambda: self._on_error(msg))
+        except Exception as exc:
+            msg = f"{exc}\n{traceback.format_exc(limit=3)}"
+            self._post(gen, lambda: self._on_error(msg))
+
+    def _on_error(self, msg: str):
+        self._data = None
+        self._progress.set(0.0)
+        self._set_status("Erreur — voir le détail ci-dessous.")
+        self._set_diag("⚠ " + msg)
+
+    def _on_stack_done(self, data: dict):
+        self._data = data
+        self._progress.set(1.0)
+        self._set_status(f"Mini-stack de {data['k']} images calculé en "
+                         f"{data['t_total']:.1f} s.")
+        self._render_panels()
+
+    # ── Rendering (UI thread: small images, ~0.1 s) ──────────────────────────
+
+    def _render_panels(self):
+        self._render_job = None
+        d = self._data
+        if d is None:
+            return
+        params = self._get_params()
+        cfg = dict(d["cfg"])
+        cfg.update({k: v for k, v in _stack_video_config(params).items()
+                    if k in ("target", "lce", "rm_green", "saturation")})
+        prep, geom = d["prep"], d["prep"]["geom"]
+        renderer = _StackRenderer(cfg)
+        counter = bool(params.get("sv_counter", True))
+
+        st1: dict = {}
+        one = (renderer.render(d["snap1"], geom.sky_mask, 1, st1)
+               if d["snap1"] is not None else None)
+        # The K panel continues the noise ramp started at 1 image, like the video
+        stk = {"sigma_ref": st1.get("sigma_ref"), "n_ref": st1.get("n_ref")}
+        t_r = time.perf_counter()
+        kimg = renderer.render(d["snapk"], geom.sky_mask, d["k"], stk)
+        t_render = time.perf_counter() - t_r
+        p_k = renderer.last_params
+
+        raw = prep["raw_u8"].copy()
+        if counter:
+            _draw_counter(raw, "Image brute")
+            if one is not None:
+                _draw_counter(one, "Stack : 1 image")
+            if kimg is not None:
+                _draw_counter(kimg, f"Stack : {d['k']} images")
+        if self._show_mask.get():
+            raw = geom.draw_overlay(raw)
+            one = geom.draw_overlay(one) if one is not None else None
+            kimg = geom.draw_overlay(kimg) if kimg is not None else None
+        self._imgs = {"raw": raw, "one": one, "k": kimg}
+        self._titles["k"].configure(text=f"{d['k']} images empilées")
+        self._show()
+        self._set_diag(self._diagnostics(d, params, p_k, t_render))
+
+    def _show(self):
+        for key, lbl in self._lbls.items():
+            bgr = self._imgs.get(key)
+            if bgr is None:
+                lbl.configure(image="")
+                continue
+            photo = _bgr_to_photo(bgr, self._W, self._H)
+            setattr(self, f"_photo_{key}", photo)     # keep a reference (GC)
+            lbl.configure(image=photo)
+            win = self._zoom_wins.get(key)
+            if win is not None and win.winfo_exists():
+                win.update_image(bgr)
+
+    def _diagnostics(self, d: dict, params: dict, p_k: "dict | None",
+                     t_render: float) -> str:
+        prep, rows = d["prep"], d["rows"]
+        fw, fh = prep["full_w"], prep["full_h"]
+        L = []
+        L.append(f"Séquence : {d['n_full']} images à empiler "
+                 f"({os.path.basename(d['seq_first'])} → {os.path.basename(d['seq_last'])}), "
+                 f"{fw}×{fh} px. Aperçu : {d['k']} premières images réduites à "
+                 f"{prep['w']}×{prep['h']} px.")
+        L.append(f"Référence : {d['ref_stars']} étoiles détectées (k·σ = "
+                 f"{d['cfg']['k_sigma']:.1f}).")
+        bad = [r["name"] for r in rows if r["status"] == "not_aligned"]
+        line = (f"Alignement : {d['aligned']} / {d['k']} alignées")
+        if bad:
+            line += f", {len(bad)} non alignée(s) ({', '.join(bad[:4])}{'…' if len(bad) > 4 else ''})"
+        if d["skipped"]:
+            line += f", {d['skipped']} ignorée(s) (illisible ou autre taille)"
+        L.append(line + ".")
+        ws = [r["weight"] for r in rows if r["status"] == "aligned"]
+        if len(ws) > 1:
+            L.append(f"Poids (bruit) : min {min(ws):.2f} · médiane {float(np.median(ws)):.2f}"
+                     f" · max {max(ws):.2f}" + ("" if d["cfg"]["weighting"]
+                                               else "  (pondération désactivée)"))
+        rej = [(r["rejected"], r["name"]) for r in rows if r.get("rejected") is not None]
+        if d["cfg"]["kappa"] <= 0:
+            L.append("Rejet σ : désactivé.")
+        elif rej:
+            worst = max(rej)
+            L.append(f"Rejet σ (κ = {d['cfg']['kappa']:.2f}) : {100 * np.mean([x for x, _ in rej]):.2f} % "
+                     f"des pixels rejetés en moyenne, max {100 * worst[0]:.2f} % ({worst[1]}).")
+        else:
+            L.append(f"Rejet σ : actif à partir de la 11e image — augmenter K pour le voir agir.")
+        sat = prep["sat_level"]
+        is_fits = os.path.splitext(d["seq"][0])[1].lower() in (".fit", ".fits")
+        if not sat:
+            L.append("Saturation capteur : aucune détectée dans la 1re image.")
+        else:
+            L.append("Saturation capteur : " + ("détectée" if is_fits else "niveau 8 bits")
+                     + f" ({sat:.0f} en unités du stack) — couleur neutralisée sur les "
+                       "cœurs d'étoiles écrêtés. Un halo coloré autour des étoiles "
+                       "brillantes vient de l'optique (aberration chromatique).")
+        if p_k is not None:
+            L.append(f"Étirement ({d['k']} images) : fond visé {100 * p_k['target']:.0f} %, "
+                     f"β = {p_k['beta']:.0f}, gains R/V/B = "
+                     + "/".join(f"{g:.2f}" for g in p_k["gains"])
+                     + f", rampe du fond auto n_eff = {p_k['n_eff']:.1f} / {_AS_RAMP_IMAGES}"
+                       " (baisse du bruit mesurée, gradient de ciel inclus).")
+
+        # Video + cost estimate for the full run
+        fps = int(params.get("fps", 30))
+        n_video = max(3, int(round(float(params["sv_duration"]) * fps)))
+        n_use = d["n_full"]
+        mw = int(params.get("sv_max_width", 1920))
+        vw, vh = ((mw - mw % 2, int(round(fh * mw / fw)) // 2 * 2)
+                  if 0 < mw < fw else (fw, fh))
+        hold = (n_video - 1) / max(1, n_use)
+        L.append(f"Vidéo : {n_video} images à {fps} ips ({n_video / fps:.1f} s), {vw}×{vh} px — "
+                 + (f"chaque étape tenue ~{hold:.1f} image(s)." if hold >= 1 else
+                    f"~{n_use - (n_video - 1)} étapes intermédiaires sautées "
+                    "(toutes les images restent empilées)."))
+        k = max(1, d["k"])
+        px_ratio = (fw * fh) / float(prep["w"] * prep["h"])
+        load_per_img = max(0.0, d["t_total"] - d["t_stack"]) / k
+        # Measured on M31 (4056×2160, 597 images): 26 min real vs ×1.3 → 47 min
+        # estimated — the small preview frames carry a fixed per-image cost
+        # that doesn't scale with the pixel count.
+        stack_per_img = d["t_stack"] / k * px_ratio * 0.7
+        render_per_img = t_render * (vw * vh) / float(prep["w"] * prep["h"]) * 1.5
+        per_img = max(load_per_img, stack_per_img, render_per_img)
+        est = _stack_video_estimate(n_use, fw, fh, n_video, vw, vh,
+                                    per_img / (fw * fh / 1e6))
+        avail = _mem_available_gb()
+        mem_line = f"≈ {est['mem_gb']:.1f} Go de RAM"
+        if avail is not None:
+            mem_line += f" (disponible : {avail:.1f} Go)"
+            if est["mem_gb"] > 0.9 * avail:
+                mem_line += "  ⚠ risque de manque de mémoire"
+        secs = est["seconds"]
+        dur = f"{secs / 60:.0f} min" if secs >= 90 else f"{max(1, secs):.0f} s"
+        L.append(f"Estimation du traitement complet : ≈ {dur} "
+                 f"(~{per_img:.1f} s/image), {mem_line}.")
+        for wmsg in d["warns"]:
+            L.append("⚠ " + wmsg)
+        return "\n".join(L)
+
+    # ── Misc ──────────────────────────────────────────────────────────────────
+
+    def _set_status(self, text: str):
+        self._lbl_status.configure(text=text)
+
+    def _set_diag(self, text: str):
+        self._diag.configure(state="normal")
+        self._diag.delete("1.0", "end")
+        self._diag.insert("1.0", text)
+        self._diag.configure(state="disabled")
+
+    def _open_zoom(self, key: str):
+        bgr = self._imgs.get(key)
+        if bgr is None:
+            return
+        win = self._zoom_wins.get(key)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            win.focus_force()
+            return
+        self._zoom_wins[key] = _ZoomWindow(self, self._titles[key].cget("text"), bgr)
+
+    def _on_window_resize(self, event):
+        if event.widget is not self:
+            return
+        if self._resize_job:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(150, self._apply_resize)
+
+    def _apply_resize(self):
+        self._resize_job = None
+        self.update_idletasks()
+        total_w = self._panels.winfo_width()
+        total_h = self._panels.winfo_height()
+        if total_w < 60 or total_h < 60:
+            return
+        new_w, new_h = max(120, total_w // 3 - 20), max(100, total_h - 50)
+        if abs(new_w - self._W) < 4 and abs(new_h - self._H) < 4:
+            return
+        self._W, self._H = new_w, new_h
+        for lbl in self._lbls.values():
+            lbl.configure(width=self._W, height=self._H)
+        self._show()
+
+    def destroy(self):
+        self._gen += 1            # stop a running mini-stack
+        super().destroy()
+
+
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 
 class AllSkyApp(ctk.CTk):
@@ -1794,6 +3148,7 @@ class AllSkyApp(ctk.CTk):
         self._src_dir: str = ""
         self._processing: bool = False
         self._preview_win: PreviewWindow | None = None
+        self._sv_preview_win: StackVideoPreview | None = None
         self._build_ui()
         self._load_settings()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1859,6 +3214,21 @@ class AllSkyApp(ctk.CTk):
             ("align_mask_radius", self._align_mask_radius),
             ("align_ground_cutoff", self._align_ground_cutoff),
             ("align_k_sigma",     self._align_k_sigma),
+            ("align_out",         self._align_out_var),
+            ("sv_duration",       self._sv_duration),
+            ("sv_max_width",      self._sv_max_width_var),
+            ("sv_progression",    self._sv_progression_var),
+            ("sv_target_auto",    self._sv_target_auto),
+            ("sv_target",         self._sv_target),
+            ("sv_lce",            self._sv_lce),
+            ("sv_saturation",     self._sv_saturation),
+            ("sv_kappa",          self._sv_kappa),
+            ("sv_remove_green",   self._sv_remove_green),
+            ("sv_linearize",      self._sv_linearize),
+            ("sv_hot_pixels",     self._sv_hot_pixels),
+            ("sv_bg_norm",        self._sv_bg_norm),
+            ("sv_weighting",      self._sv_weighting),
+            ("sv_counter",        self._sv_counter),
         ]
 
     def _save_settings(self):
@@ -1917,6 +3287,10 @@ class AllSkyApp(ctk.CTk):
                     var.set(data[key])
                 except Exception:
                     pass
+
+        # Setting a checkbox variable doesn't fire its command: re-sync the
+        # Stack & Align sub-frames (the video panel depends on two settings).
+        self._toggle_align_stack()
 
     # ── Layout helpers ────────────────────────────────────────────────────────
 
@@ -2447,13 +3821,25 @@ class AllSkyApp(ctk.CTk):
             anchor="w")
         self._lbl_align_ref.pack(side="left", padx=10, fill="x", expand=True)
 
+        out_mode_row = ctk.CTkFrame(self._align_sub, fg_color="transparent")
+        out_mode_row.pack(fill="x", pady=(2, 4))
+        ctk.CTkLabel(out_mode_row, text="Sortie :", width=150, anchor="w").pack(side="left")
+        self._align_out_var = ctk.StringVar(value="Image finale (.png)")
+        ctk.CTkOptionMenu(out_mode_row,
+                          variable=self._align_out_var,
+                          values=["Image finale (.png)",
+                                  "Vidéo de progression du stack (.mp4)"],
+                          command=lambda *_: self._toggle_align_stack(),
+                          width=300).pack(side="left", padx=8)
+
         self._align_n = ctk.IntVar(value=10)
         self._slider_row(self._align_sub, "Nombre d'images à empiler (N)",
-                         self._align_n, 3, 60, 1, integer=True)
+                         self._align_n, 3, 1500, 1, integer=True)
         ctk.CTkLabel(self._align_sub,
                      text="Les N images consécutives à partir de la référence (ou du début du "
                           "dossier si aucune n'est choisie) sont alignées sur le ciel puis "
-                          "moyennées. N élevé = moins de bruit mais traitement plus long.",
+                          "moyennées. N élevé = moins de bruit mais traitement plus long. "
+                          "Les flèches ← → du clavier sur le curseur ajustent N à l'unité.",
                      font=ctk.CTkFont(size=11), text_color="gray60",
                      wraplength=600).pack(anchor="w", pady=(0, 6))
 
@@ -2499,16 +3885,111 @@ class AllSkyApp(ctk.CTk):
                      font=ctk.CTkFont(size=11), text_color="gray60",
                      wraplength=600).pack(anchor="w", pady=(0, 4))
 
+        # ── Stack video (Multicam Live Stack pipeline) ─────────────────────
+        # Sibling of _align_sub (not a child): _set_frame_state only reaches
+        # two widget levels deep.
+        self._section(tab_align, "Vidéo de progression du stack (pipeline Live Stack Multicam)")
+        self._sv_sub = ctk.CTkFrame(tab_align, fg_color="transparent")
+        self._sv_sub.pack(fill="x", padx=28)
+
+        ctk.CTkButton(self._sv_sub, text="Aperçu de la vidéo de stack…", height=32,
+                      command=self._open_sv_preview).pack(anchor="w", pady=(2, 2))
+        ctk.CTkLabel(self._sv_sub,
+                     text="Mini-stack des K premières images (réduites) avec le même pipeline : "
+                          "brute | 1 image | K images, diagnostics (alignement, poids, rejet σ, "
+                          "saturation) et estimation du temps et de la mémoire. Les réglages de "
+                          "rendu se mettent à jour instantanément, ceux d'empilement relancent "
+                          "le mini-stack.",
+                     font=ctk.CTkFont(size=11), text_color="gray60",
+                     wraplength=600).pack(anchor="w", pady=(0, 6))
+
+        self._sv_duration = ctk.IntVar(value=30)
+        self._slider_row(self._sv_sub, "Durée de la vidéo (s)",
+                         self._sv_duration, 5, 120, 1, integer=True)
+
+        prog_row = ctk.CTkFrame(self._sv_sub, fg_color="transparent")
+        prog_row.pack(fill="x", pady=2)
+        ctk.CTkLabel(prog_row, text="Progression :", width=238, anchor="w").pack(side="left")
+        self._sv_progression_var = ctk.StringVar(value="Linéaire")
+        ctk.CTkOptionMenu(prog_row, variable=self._sv_progression_var,
+                          values=["Linéaire", "Logarithmique"],
+                          width=180).pack(side="left", padx=8)
+        ctk.CTkLabel(self._sv_sub,
+                     text="Image 1 = brute, image 2 = 1 image traitée, image 3 = 2 images "
+                          "empilées + traitement… jusqu'à N. Le nombre d'images vidéo vaut "
+                          "durée × FPS : si N est plus petit, chaque étape est tenue plusieurs "
+                          "images ; s'il est plus grand, des étapes intermédiaires sont sautées "
+                          "(mais toutes les images sont bien empilées). Logarithmique = plus de "
+                          "temps sur les premières images, là où l'image évolue le plus.",
+                     font=ctk.CTkFont(size=11), text_color="gray60",
+                     wraplength=600).pack(anchor="w", pady=(0, 6))
+
+        width_row = ctk.CTkFrame(self._sv_sub, fg_color="transparent")
+        width_row.pack(fill="x", pady=2)
+        ctk.CTkLabel(width_row, text="Largeur max de la vidéo (px) :", width=238,
+                     anchor="w").pack(side="left")
+        self._sv_max_width_var = ctk.StringVar(value="1920")
+        ctk.CTkOptionMenu(width_row, variable=self._sv_max_width_var,
+                          values=["1280", "1920", "2560", "3840", "Native"],
+                          width=180).pack(side="left", padx=8)
+        ctk.CTkLabel(self._sv_sub,
+                     text="L'empilement et l'image finale PNG restent en pleine résolution ; "
+                          "seule la vidéo est réduite (rendu plus rapide, fichier lisible partout).",
+                     font=ctk.CTkFont(size=11), text_color="gray60",
+                     wraplength=600).pack(anchor="w", pady=(0, 6))
+
+        self._sv_target_auto = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(self._sv_sub, text="Fond de ciel automatique (10 % → 18 % quand le bruit baisse)",
+                        variable=self._sv_target_auto).pack(anchor="w", pady=2)
+        self._sv_target = ctk.DoubleVar(value=0.15)
+        self._slider_row(self._sv_sub, "Niveau du fond (si manuel)",
+                         self._sv_target, 0.03, 0.40, 0.01)
+
+        self._sv_lce = ctk.DoubleVar(value=0.5)
+        self._slider_row(self._sv_sub, "Contraste local (0 = désactivé)",
+                         self._sv_lce, 0.0, 1.5, 0.05)
+        self._sv_saturation = ctk.DoubleVar(value=1.3)
+        self._slider_row(self._sv_sub, "Saturation",
+                         self._sv_saturation, 0.0, 3.0, 0.05)
+        self._sv_kappa = ctk.DoubleVar(value=3.0)
+        self._slider_row(self._sv_sub, "Rejet σ (κ, 0 = désactivé)",
+                         self._sv_kappa, 0.0, 6.0, 0.25)
+        ctk.CTkLabel(self._sv_sub,
+                     text="Rejet σ au fil de l'eau (actif après 10 images) : une valeur à plus "
+                          "de κ·σ au-dessus de la moyenne (satellite, avion, rayon cosmique) "
+                          "n'est pas empilée. Contraste local et saturation sont ceux de "
+                          "l'aperçu Live Stack de Multicam ; les réglages de l'onglet "
+                          "« Image & Couleur » ne s'appliquent pas à cette vidéo.",
+                     font=ctk.CTkFont(size=11), text_color="gray60",
+                     wraplength=600).pack(anchor="w", pady=(0, 6))
+
+        self._sv_remove_green = ctk.BooleanVar(value=False)
+        self._sv_linearize    = ctk.BooleanVar(value=True)
+        self._sv_hot_pixels   = ctk.BooleanVar(value=True)
+        self._sv_bg_norm      = ctk.BooleanVar(value=True)
+        self._sv_weighting    = ctk.BooleanVar(value=True)
+        self._sv_counter      = ctk.BooleanVar(value=True)
+        for text, var in (
+                ("Retrait du vert (SCNR neutre moyen lissé)", self._sv_remove_green),
+                ("Linéariser les JPEG/PNG (sRGB → linéaire) avant empilement", self._sv_linearize),
+                ("Corriger les pixels chauds", self._sv_hot_pixels),
+                ("Normaliser le fond de ciel sur l'image de référence", self._sv_bg_norm),
+                ("Pondérer les images par leur bruit (σ_réf / σ)²", self._sv_weighting),
+                ("Afficher le compteur d'images empilées", self._sv_counter)):
+            ctk.CTkCheckBox(self._sv_sub, text=text, variable=var).pack(anchor="w", pady=2)
+
         ctk.CTkLabel(tab_align,
                      text="ℹ Empilement Aligné : détecte les étoiles, aligne le ciel par "
                           "rotation/translation (RANSAC) sur l'image de référence, moyenne le "
                           "ciel aligné et le sol figé (moyenne brute), puis fusionne avec un "
                           "dégradé (feather) à la frontière du masque. Produit une image PNG "
-                          "unique — indépendant des autres onglets.",
+                          "unique, ou une vidéo <nom>_stackvideo.mp4 (+ image finale PNG) "
+                          "montrant le stack se construire — indépendant des autres onglets.",
                      font=ctk.CTkFont(size=11), text_color="gray60",
                      wraplength=860).pack(anchor="w", padx=6, pady=(8, 0))
 
         self._set_frame_state(self._align_sub, False)
+        self._set_frame_state(self._sv_sub, False)
 
         # ── Pinned footer: live preview + progress + run (always visible) ──
         footer = ctk.CTkFrame(self, fg_color="transparent")
@@ -2561,6 +4042,19 @@ class AllSkyApp(ctk.CTk):
                     self._sat_stretch_SP, self._sat_stretch_D):
             var.trace_add("write", self._notify_preview)
 
+        # Stack-video preview: rendering settings re-render the cached
+        # mini-stack, stacking settings recompute it.
+        for var in (self._sv_target_auto, self._sv_target, self._sv_lce,
+                    self._sv_saturation, self._sv_remove_green, self._sv_counter,
+                    self._sv_duration, self._sv_progression_var,
+                    self._sv_max_width_var, self._fps_var):
+            var.trace_add("write", lambda *_: self._notify_sv_preview(stack=False))
+        for var in (self._align_n, self._align_mask_radius, self._align_ground_cutoff,
+                    self._align_k_sigma, self._sv_kappa, self._sv_linearize,
+                    self._sv_hot_pixels, self._sv_bg_norm, self._sv_weighting,
+                    self._fits_bayer, self._fits_pattern_var):
+            var.trace_add("write", lambda *_: self._notify_sv_preview(stack=True))
+
     # ── Toggle callbacks ──────────────────────────────────────────────────────
 
     def _toggle_stack(self):
@@ -2591,7 +4085,12 @@ class AllSkyApp(ctk.CTk):
         self._set_frame_state(self._sat_mask_sub, self._sat_use_mask.get())
 
     def _toggle_align_stack(self):
-        self._set_frame_state(self._align_sub, self._use_align_stack.get())
+        on = self._use_align_stack.get()
+        self._set_frame_state(self._align_sub, on)
+        self._set_frame_state(self._sv_sub, on and self._align_is_video())
+
+    def _align_is_video(self) -> bool:
+        return "mp4" in self._align_out_var.get().lower()
 
     def _pick_align_ref(self):
         path = filedialog.askopenfilename(
@@ -2607,6 +4106,7 @@ class AllSkyApp(ctk.CTk):
             return
         self._align_ref_path = path
         self._lbl_align_ref.configure(text=os.path.basename(path))
+        self._notify_sv_preview(stack=True)
 
     # ── Preview ───────────────────────────────────────────────────────────────
 
@@ -2620,6 +4120,7 @@ class AllSkyApp(ctk.CTk):
     def _get_preview_params(self) -> dict:
         params = self._collect_params()
         params["src_dir"] = self._src_dir
+        params["fps"] = self._fps_var.get()
         return params
 
     def _ghs_dict(self) -> dict:
@@ -2631,6 +4132,19 @@ class AllSkyApp(ctk.CTk):
             HP    = self._ghs_HP.get(),
             gamma = self._ghs_gamma.get() if self._ghs_lin.get() else 1.0,
         )
+
+    def _open_sv_preview(self):
+        win = self._sv_preview_win
+        if win is not None and win.winfo_exists():
+            win.lift()
+            win.focus_force()
+            return
+        self._sv_preview_win = StackVideoPreview(self, self._get_preview_params)
+
+    def _notify_sv_preview(self, stack: bool):
+        win = self._sv_preview_win
+        if win is not None and win.winfo_exists():
+            (win.refresh_stack if stack else win.refresh_render)()
 
     def _notify_preview(self, *_):
         if self._preview_win is not None and self._preview_win.winfo_exists():
@@ -2652,6 +4166,7 @@ class AllSkyApp(ctk.CTk):
         short = os.path.basename(d) or d
         self._lbl_dir.configure(
             text=f"{short}  •  {n} image{'s' if n != 1 else ''} trouvée{'s' if n != 1 else ''}")
+        self._notify_sv_preview(stack=True)
 
     # ── Start processing ──────────────────────────────────────────────────────
 
@@ -2720,6 +4235,23 @@ class AllSkyApp(ctk.CTk):
             align_ground_cutoff = self._align_ground_cutoff.get(),
             align_k_sigma     = self._align_k_sigma.get(),
             align_ref_path    = self._align_ref_path,
+            align_video       = self._align_is_video(),
+            # Stack video (Multicam Live Stack pipeline)
+            sv_duration       = self._sv_duration.get(),
+            sv_progression    = ("log" if self._sv_progression_var.get() == "Logarithmique"
+                                 else "linear"),
+            sv_target         = None if self._sv_target_auto.get() else self._sv_target.get(),
+            sv_local_contrast = self._sv_lce.get(),
+            sv_saturation     = self._sv_saturation.get(),
+            sv_kappa          = self._sv_kappa.get(),
+            sv_remove_green   = self._sv_remove_green.get(),
+            sv_linearize      = self._sv_linearize.get(),
+            sv_hot_pixels     = self._sv_hot_pixels.get(),
+            sv_bg_norm        = self._sv_bg_norm.get(),
+            sv_weighting      = self._sv_weighting.get(),
+            sv_counter        = self._sv_counter.get(),
+            sv_max_width      = (0 if self._sv_max_width_var.get() == "Native"
+                                 else int(self._sv_max_width_var.get())),
         )
 
     def _start_processing(self):
@@ -2752,6 +4284,8 @@ class AllSkyApp(ctk.CTk):
                    else "Génération Star Trail (vidéo)…")
         elif use_sat_enhanced:
             lbl = "Renforcement traînées satellites…"
+        elif use_align_stack and params["align_video"]:
+            lbl = "Vidéo de progression du stack…"
         elif use_align_stack:
             lbl = "Empilement aligné (détection étoiles + RANSAC)…"
         else:
@@ -2764,6 +4298,8 @@ class AllSkyApp(ctk.CTk):
             target_fn = process_star_trail
         elif use_sat_enhanced:
             target_fn = process_satellites
+        elif use_align_stack and params["align_video"]:
+            target_fn = process_stack_video
         elif use_align_stack:
             target_fn = process_stack_align
         else:
